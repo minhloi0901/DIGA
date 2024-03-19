@@ -1,4 +1,7 @@
 # 🦸🏻‍♀️ DIGA  - Dynamically Instance-Guided Adaptation: A Backward-free Approach for Test-Time Domain Adaptive Semantic Segmentation
+
+We are still working on this repo now.
+
 # Environment Setup
 
 Before everything start, please make sure the following environment variables(`UDATADIR, UPRJDIR, UOUTDIR`) are setup.  The following operation would only modifying the above three folders on your devices. 
