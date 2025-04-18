@@ -4,7 +4,7 @@
 import hydra
 import pyrootutils
 from omegaconf import DictConfig
-
+import os
 # project root setup
 # searches for root indicators in parent dirs, like ".git", "pyproject.toml", etc.
 # sets PROJECT_ROOT environment variable (used in `configs/paths/default.yaml`)
@@ -12,7 +12,11 @@ from omegaconf import DictConfig
 # adds root dir to the PYTHONPATH (so this file can be run from any place)
 # https://github.com/ashleve/pyrootutils
 root = pyrootutils.setup_root(__file__, dotenv=True, pythonpath=True)
-
+os.environ["UOUTDIR"] = "/kaggle/working/DIGA/output"
+os.environ["UDATADIR"] = "/kaggle/input/cityscape-diga"
+os.environ["PROJECT_ROOT"] = "/kaggle/working/DIGA"
+os.environ["WANDB_API_KEY"] = "e22d14a8d4b7c0b3fd491180f4b4eb0d6c5114a2"
+os.environ["NUM_WORKERS"] = "4"
 
 @hydra.main(version_base="1.2", config_path=str(root / "configs"), config_name="train.yaml")
 def main(cfg: DictConfig) -> float:

@@ -20,8 +20,8 @@ task_name: "test-time-DA"
 # seed: 55555
 
 trainer:
-  min_epochs: 1
-  max_epochs: 1
+  min_epochs: 5
+  max_epochs: 5
   # gradient_clip_val: 0.5
   log_every_n_steps: 5
   num_sanity_val_steps: 0
@@ -41,7 +41,7 @@ train: False
 
 # evaluate on test set, using best model weights achieved during training
 # lightning chooses best weights based on the metric specified in checkpoint callback
-test: True
+test: False
 
 # logger:
 #   wandb:
