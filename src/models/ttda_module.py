@@ -300,6 +300,11 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
         self._check_input_dim(input)
 
         exponential_average_factor = 0.0
+        
+        if not hasattr(self, 'cumulative_mean'):
+            self.register_buffer('cumulative_mean', torch.zeros_like(self.running_mean))
+            self.register_buffer('cumulative_var', torch.zeros_like(self.running_var))
+            self.register_buffer('batch_count', torch.tensor(0.))
 
         if self.training and self.track_running_stats:
             if self.num_batches_tracked is not None:
@@ -332,8 +337,16 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
                 self.running_var = exponential_average_factor * var * n / (n - 1)\
                     + (1 - exponential_average_factor) * self.running_var
         else:
-            mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
-            var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
+            with torch.no_grad():
+                self.batch_count += 1
+                self.cumulative_mean = (self.cumulative_mean * (self.batch_count - 1) + mean_cur) / self.batch_count
+                self.cumulative_var  = (self.cumulative_var  * (self.batch_count - 1) + var_cur ) / self.batch_count
+    
+            mean = self.lambda_ * self.running_mean + (1-self.lambda_) * self.cumulative_mean
+            var = self.lambda_ * self.running_var + (1-self.lambda_) * self.cumulative_var
+   
+            # mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
+            # var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
         # normal train -> update running mean, var. use current mean, var
         # target 
         # eval -> use self.running_mean, self.running_var
@@ -1567,14 +1580,15 @@ class DIGA(LightningModule):
         cfg: object = None,
     ):
         super().__init__()
+        # self.features = []
+        # self.labels = []
         self.save_hyperparameters(logger=False, ignore=["net"])
         
         self.net = net(
             num_classes=self.hparams.dataset_info["num_classes"],
             output_size=self.hparams.dataset_info["image_size"],
         )
-        self.features = []
-        self.labels = []
+
         # loss function
         self.criterion = torch.nn.CrossEntropyLoss()
 
@@ -1615,10 +1629,8 @@ class DIGA(LightningModule):
         x, y, shape_, name_ = batch
         loss, preds, targets, info, feature = self.step(batch)
         
-        MAX_FEATURES = 100
-        if (len(self.features) * feature.size(0) < MAX_FEATURES):
-            self.features.append(feature.cpu().detach())
-            self.labels.append(targets.cpu().detach())
+        # self.features.append(feature.cpu().detach())
+        # self.labels.append(targets.cpu().detach())
         # log test metrics
         acc = self.test_acc[dataloader_idx](preds, targets)
         self.log(f"test/loss", loss, on_step=True, on_epoch=True, prog_bar=False, add_dataloader_idx=True)
@@ -1651,11 +1663,11 @@ class DIGA(LightningModule):
         return outputs.cpu(), to_logs, feature
     
     def test_epoch_end(self, outputs: List[Any]):
-        features = torch.cat(self.features, dim=0)
-        labels = torch.cat(self.labels, dim=0)
-        self.visualize_tsne(features, labels)
-        self.features = []
-        self.labels = []
+        # features = torch.cat(self.features, dim=0)
+        # labels = torch.cat(self.labels, dim=0)
+        # self.visualize_tsne(features, labels)
+        # self.features = []
+        # self.labels = []
         
         test_accs = [test_acc.compute() for test_acc in self.test_acc]
         acc_mean = sum(test_accs) / len(test_accs)
@@ -1851,40 +1863,30 @@ class DIGA(LightningModule):
             if "wandb" in lg.__module__:
                 return lg
         raise ValueError("No wandb logger found")
-    
-    def visualize_tsne(self, features, labels, max_samples=500):    
-        import umap    
-        from sklearn.manifold import TSNE
-        import matplotlib.pyplot as plt
 
-        self.log("running_tsne", True, on_step=False, on_epoch=True, prog_bar=True)
-        features = features.numpy()
-        B, C, H, W = features.shape
-        features = features.reshape(B, C * H * W)
-        labels = labels.numpy()
+    # def visualize_tsne(self, features, labels):        
+    #     from sklearn.manifold import TSNE
+    #     import matplotlib.pyplot as plt
         
-        if features.shape[0] > max_samples:
-            indices = np.random.choice(features.shape[0], max_samples, replace=False)
-            features = features[indices]
-            labels = labels[indices]
+    #     features = features.numpy()
+    #     labels = labels.numpy()
   
-        # reducer_umap = umap.UMAP(n_neighbors=15, min_dist=0.1, n_components=2, metric='euclidean', random_state=42)
-        tsne = TSNE(n_components=2, perplexity=10, n_iter=300, random_state=42)
-        features_2d = tsne.fit_transform(features)
-        plt.figure(figsize=(10, 10))
-        num_classes = len(np.unique(labels))
+    #     tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42)
+    #     features_2d = tsne.fit_transform(features)
+    #     plt.figure(figsize=(10, 10))
+    #     num_classes = len(np.unique(labels))
         
-        for class_id in range(num_classes):
-            idx = labels == class_id
-            plt.scatter(features_2d[idx, 0], features_2d[idx, 1], label=f"Class {class_id}", alpha=0.6)
+    #     for class_id in range(num_classes):
+    #         idx = labels == class_id
+    #         plt.scatter(features_2d[idx, 0], features_2d[idx, 1], label=f"Class {class_id}", alpha=0.6)
 
-        plt.legend()
-        plt.title("t-SNE Visualization of Features")
-        plt.xlabel("t-SNE Dimension 1")
-        plt.ylabel("t-SNE Dimension 2")
-        # plt.show()
-        plt.savefig("tsne_visualization.png")
-        plt.close()
+    #     # plt.legend()
+    #     # plt.title("t-SNE Visualization of Features")
+    #     # plt.xlabel("t-SNE Dimension 1")
+    #     # plt.ylabel("t-SNE Dimension 2")
+        
+    #     # plt.savefig("tsne_visualization.png")
+    #     # plt.close()
 
 if __name__ == "__main__":
     import hydra
