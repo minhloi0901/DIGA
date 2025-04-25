@@ -17,13 +17,13 @@ defaults:
 
 tags: ["ttda", "coding"]
 task_name: "test-time-DA"
-# seed: 55555
+seed: 55555
 
 trainer:
-  min_epochs: 5
-  max_epochs: 5
+  min_epochs: 1
+  max_epochs: 1
   # gradient_clip_val: 0.5
-  log_every_n_steps: 5
+  log_every_n_steps: 1
   num_sanity_val_steps: 0
   # inference_mode: False
 # model:

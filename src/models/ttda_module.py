@@ -24,6 +24,7 @@ import wandb
 import random
 from tqdm import tqdm
 import time 
+import matplotlib.pyplot as plt
 
 logger = logging.getLogger('lightning')
 logging.getLogger('PIL').setLevel(logging.INFO)
@@ -300,11 +301,6 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
         self._check_input_dim(input)
 
         exponential_average_factor = 0.0
-        
-        if not hasattr(self, 'cumulative_mean'):
-            self.register_buffer('cumulative_mean', torch.zeros_like(self.running_mean))
-            self.register_buffer('cumulative_var', torch.zeros_like(self.running_var))
-            self.register_buffer('batch_count', torch.tensor(0.))
 
         if self.training and self.track_running_stats:
             if self.num_batches_tracked is not None:
@@ -337,16 +333,10 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
                 self.running_var = exponential_average_factor * var * n / (n - 1)\
                     + (1 - exponential_average_factor) * self.running_var
         else:
-            with torch.no_grad():
-                self.batch_count += 1
-                self.cumulative_mean = (self.cumulative_mean * (self.batch_count - 1) + mean_cur) / self.batch_count
-                self.cumulative_var  = (self.cumulative_var  * (self.batch_count - 1) + var_cur ) / self.batch_count
-    
-            mean = self.lambda_ * self.running_mean + (1-self.lambda_) * self.cumulative_mean
-            var = self.lambda_ * self.running_var + (1-self.lambda_) * self.cumulative_var
-   
-            # mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
-            # var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
+            mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
+            var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
+            self.mean = mean.detach()
+            self.var = var.detach()
         # normal train -> update running mean, var. use current mean, var
         # target 
         # eval -> use self.running_mean, self.running_var
@@ -616,7 +606,7 @@ class SIFAEvalUpdateBatchNorm2d(EvalUpdateBatchNorm2d):
             # var = self.lambda_ * self.source_var + (1-self.lambda_) * self.running_var
             mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
             var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
-
+        
         input = (input - mean[None, :, None, None]) / (torch.sqrt(var[None, :, None, None] + self.eps))
         if self.affine:
             input = input * self.weight[None, :, None, None] + self.bias[None, :, None, None]
@@ -1580,8 +1570,6 @@ class DIGA(LightningModule):
         cfg: object = None,
     ):
         super().__init__()
-        # self.features = []
-        # self.labels = []
         self.save_hyperparameters(logger=False, ignore=["net"])
         
         self.net = net(
@@ -1600,6 +1588,11 @@ class DIGA(LightningModule):
         self.val_acc_best = MaxMetric()
         
         self.test_step_global = 0
+        
+        # Track forward step mean and variance from SIFA BN layers
+        self.forward_means = []
+        self.forward_vars = []
+        self.batch_indices = []
 
         self.save_hyperparameters(logger=False, ignore=["net"])
         self._replace_bn()
@@ -1629,8 +1622,6 @@ class DIGA(LightningModule):
         x, y, shape_, name_ = batch
         loss, preds, targets, info, feature = self.step(batch)
         
-        # self.features.append(feature.cpu().detach())
-        # self.labels.append(targets.cpu().detach())
         # log test metrics
         acc = self.test_acc[dataloader_idx](preds, targets)
         self.log(f"test/loss", loss, on_step=True, on_epoch=True, prog_bar=False, add_dataloader_idx=True)
@@ -1659,15 +1650,52 @@ class DIGA(LightningModule):
             self.hparams.cfg,
         )
 
+        bn_means = []
+        bn_vars = []
+        for m in self.net.modules():
+            if isinstance(m, SIFABatchNorm2dTrainable):
+                mean_cur = m.mean.mean().item()
+                var_cur = m.var.mean().item() 
+                bn_means.append(mean_cur)
+                bn_vars.append(var_cur)
+        
+        if bn_means: 
+            self.forward_means.append(np.mean(bn_means))
+            self.forward_vars.append(np.mean(bn_vars))
+            self.batch_indices.append(self.test_step_global)
+
         outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs.softmax(1) * (1 - self.hparams.cfg.fusion_lambda)
         return outputs.cpu(), to_logs, feature
-    
+
     def test_epoch_end(self, outputs: List[Any]):
-        # features = torch.cat(self.features, dim=0)
-        # labels = torch.cat(self.labels, dim=0)
-        # self.visualize_tsne(features, labels)
-        # self.features = []
-        # self.labels = []
+        plt.figure(figsize=(15, 10))
+        
+        if self.forward_means:  
+            plt.subplot(2, 2, 1)
+            plt.plot(self.batch_indices, self.forward_means, 'g-')
+            plt.title('SIFA BN Forward Step Mean over Batches')
+            plt.xlabel('Batch Index')
+            plt.ylabel('Mean')
+            plt.grid(True)
+            
+            plt.subplot(2, 2, 2)
+            plt.plot(self.batch_indices, self.forward_vars, 'm-')
+            plt.title('SIFA BN Forward Step Variance over Batches')
+            plt.xlabel('Batch Index')
+            plt.ylabel('Variance')
+            plt.grid(True)
+        
+        plt.tight_layout()
+        
+        # Save plot to file
+        plt.savefig('batch_stats.png')
+        plt.close()
+        logger.info(f"Batch statistics saved to batch_stats.png")
+        
+        # Reset statistics
+        self.forward_means = []
+        self.forward_vars = []
+        self.batch_indices = []
         
         test_accs = [test_acc.compute() for test_acc in self.test_acc]
         acc_mean = sum(test_accs) / len(test_accs)
@@ -1676,10 +1704,12 @@ class DIGA(LightningModule):
             self.log(f"test/acc/dataloaderr_idx_{str(i)}", test_accs[i], on_epoch=True, prog_bar=True)
             self.log(f"test/acc/dataloaderr16_idx_{str(i)}", self.test_acc[i].compute_iou(type="16"), on_epoch=True, prog_bar=True)
             self.log(f"test/acc/dataloaderr13_idx_{str(i)}", self.test_acc[i].compute_iou(type="13"), on_epoch=True, prog_bar=True)
-            # use wandb logger to log 
+            # Log class IoU
             class_iou = self.test_acc[i].compute_class_iou()
             class_names = self.hparams.dataset_info.class_names
-            self.wandb.log_table(key=f"test/class_iou/dataloaderr_idx_{str(i)}", columns=list(class_names), data=[class_iou])
+            logger.info(f"Class IoU for dataloader {i}:")
+            for name, iou in zip(class_names, class_iou):
+                logger.info(f"  {name}: {iou:.4f}")
         for i, test_acc in enumerate(self.test_acc): # reset
             test_acc.reset()
 
@@ -1863,30 +1893,6 @@ class DIGA(LightningModule):
             if "wandb" in lg.__module__:
                 return lg
         raise ValueError("No wandb logger found")
-
-    # def visualize_tsne(self, features, labels):        
-    #     from sklearn.manifold import TSNE
-    #     import matplotlib.pyplot as plt
-        
-    #     features = features.numpy()
-    #     labels = labels.numpy()
-  
-    #     tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42)
-    #     features_2d = tsne.fit_transform(features)
-    #     plt.figure(figsize=(10, 10))
-    #     num_classes = len(np.unique(labels))
-        
-    #     for class_id in range(num_classes):
-    #         idx = labels == class_id
-    #         plt.scatter(features_2d[idx, 0], features_2d[idx, 1], label=f"Class {class_id}", alpha=0.6)
-
-    #     # plt.legend()
-    #     # plt.title("t-SNE Visualization of Features")
-    #     # plt.xlabel("t-SNE Dimension 1")
-    #     # plt.ylabel("t-SNE Dimension 2")
-        
-    #     # plt.savefig("tsne_visualization.png")
-    #     # plt.close()
 
 if __name__ == "__main__":
     import hydra
