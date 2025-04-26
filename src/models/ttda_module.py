@@ -297,55 +297,85 @@ class CustomBatchNorm2d(nn.BatchNorm2d):
         return self
 
 class SIFABatchNorm2d(CustomBatchNorm2d):
+    # def forward(self, input):
+    #     self._check_input_dim(input)
+
+    #     exponential_average_factor = 0.0
+
+    #     if self.training and self.track_running_stats:
+    #         if self.num_batches_tracked is not None:
+    #             # self.num_batches_tracked.add_(1) # ! removed at Sept. 2022
+    #             if self.momentum is None:  # use cumulative moving average
+    #                 exponential_average_factor = 1.0 / float(self.num_batches_tracked)
+    #             else:  # use exponential moving average
+    #                 exponential_average_factor = self.momentum
+
+    #     # if batch_size > 1
+    #     half_first = True
+    #     if half_first == True:
+    #         if input.size(0) > 1:
+    #             mean_cur = (input[:1].mean([0, 2, 3]) + input[1:].mean([0, 2, 3])) / 2 # ! note that we should not use batch_size > 1
+    #             var_cur = (input[:1].var([0, 2, 3], unbiased=False) + input[1:].var([0, 2, 3], unbiased=False)) / 2
+    #         else:
+    #             mean_cur = input.mean([0, 2, 3])
+    #             var_cur = input.var([0, 2, 3], unbiased=False)
+    #     else:
+    #         mean_cur = input.mean([0, 2, 3])
+    #         var_cur = input.var([0, 2, 3], unbiased=False)
+    #     # calculate running estimates
+    #     n = input.numel() / input.size(1)
+    #     if self.training:
+    #         mean, var = mean_cur, var_cur
+    #         with torch.no_grad():
+    #             self.running_mean = exponential_average_factor * mean\
+    #                 + (1 - exponential_average_factor) * self.running_mean
+    #             # update running_var with unbiased var
+    #             self.running_var = exponential_average_factor * var * n / (n - 1)\
+    #                 + (1 - exponential_average_factor) * self.running_var
+    #     else:
+    #         mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
+    #         var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
+    #         self.mean = mean.detach()
+    #         self.var = var.detach()
+    #     # normal train -> update running mean, var. use current mean, var
+    #     # target 
+    #     # eval -> use self.running_mean, self.running_var
+    #     # source + current 
+    #     input = (input - mean[None, :, None, None]) / (torch.sqrt(var[None, :, None, None] + self.eps))
+    #     if self.affine:
+    #         input = input * self.weight[None, :, None, None] + self.bias[None, :, None, None]
+
+    #     return input
+    
     def forward(self, input):
         self._check_input_dim(input)
-
-        exponential_average_factor = 0.0
-
-        if self.training and self.track_running_stats:
-            if self.num_batches_tracked is not None:
-                # self.num_batches_tracked.add_(1) # ! removed at Sept. 2022
-                if self.momentum is None:  # use cumulative moving average
-                    exponential_average_factor = 1.0 / float(self.num_batches_tracked)
-                else:  # use exponential moving average
-                    exponential_average_factor = self.momentum
-
-        # if batch_size > 1
-        half_first = True
-        if half_first == True:
-            if input.size(0) > 1:
-                mean_cur = (input[:1].mean([0, 2, 3]) + input[1:].mean([0, 2, 3])) / 2 # ! note that we should not use batch_size > 1
-                var_cur = (input[:1].var([0, 2, 3], unbiased=False) + input[1:].var([0, 2, 3], unbiased=False)) / 2
-            else:
-                mean_cur = input.mean([0, 2, 3])
-                var_cur = input.var([0, 2, 3], unbiased=False)
-        else:
-            mean_cur = input.mean([0, 2, 3])
-            var_cur = input.var([0, 2, 3], unbiased=False)
-        # calculate running estimates
-        n = input.numel() / input.size(1)
-        if self.training:
-            mean, var = mean_cur, var_cur
-            with torch.no_grad():
-                self.running_mean = exponential_average_factor * mean\
-                    + (1 - exponential_average_factor) * self.running_mean
-                # update running_var with unbiased var
-                self.running_var = exponential_average_factor * var * n / (n - 1)\
-                    + (1 - exponential_average_factor) * self.running_var
-        else:
-            mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
-            var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
-            self.mean = mean.detach()
-            self.var = var.detach()
-        # normal train -> update running mean, var. use current mean, var
-        # target 
-        # eval -> use self.running_mean, self.running_var
-        # source + current 
-        input = (input - mean[None, :, None, None]) / (torch.sqrt(var[None, :, None, None] + self.eps))
+        
+        batch_mean = input.mean([0, 2, 3])
+        batch_var = input.var([0, 2, 3], unbiased=False)
+        
+        if not hasattr(self, 'running_mean'):
+            self.running_mean = batch_mean.detach().clone()
+            self.running_var = batch_var.detach().clone()
+        
+        # Compute r and d with stop-gradient
+        r = batch_var.detach() / self.running_var
+        d = (batch_mean.detach() - self.running_mean) / self.running_var
+        
+        # Apply TBR norm
+        input_norm = (input - batch_mean[None, :, None, None]) / batch_var[None, :, None, None]
+        input_tbr = input_norm * r[None, :, None, None] + d[None, :, None, None];
+        
+        # Update EMA 
+        self.running_mean = self.lambda_ * self.running_mean + (1 - self.lambda_) * batch_mean.detach()
+        self.running_var = self.lambda_ * self.running_var + (1 - self.lambda_) * batch_var.detach()
+        
+        self.mean = self.running_mean.detach()
+        self.var = self.running_var.detach()
+        
         if self.affine:
-            input = input * self.weight[None, :, None, None] + self.bias[None, :, None, None]
-
-        return input
+            input_tbr = input_tbr * self.weight[None, :, None, None] + self.bias[None, :, None, None]
+            
+        return input_tbr
     
     def from_bn(self, bn):
         self.__init__(
@@ -1690,7 +1720,6 @@ class DIGA(LightningModule):
         # Save plot to file
         plt.savefig('batch_stats.png')
         plt.close()
-        logger.info(f"Batch statistics saved to batch_stats.png")
         
         # Reset statistics
         self.forward_means = []
@@ -1704,12 +1733,10 @@ class DIGA(LightningModule):
             self.log(f"test/acc/dataloaderr_idx_{str(i)}", test_accs[i], on_epoch=True, prog_bar=True)
             self.log(f"test/acc/dataloaderr16_idx_{str(i)}", self.test_acc[i].compute_iou(type="16"), on_epoch=True, prog_bar=True)
             self.log(f"test/acc/dataloaderr13_idx_{str(i)}", self.test_acc[i].compute_iou(type="13"), on_epoch=True, prog_bar=True)
-            # Log class IoU
+            # use wandb logger to log 
             class_iou = self.test_acc[i].compute_class_iou()
             class_names = self.hparams.dataset_info.class_names
-            logger.info(f"Class IoU for dataloader {i}:")
-            for name, iou in zip(class_names, class_iou):
-                logger.info(f"  {name}: {iou:.4f}")
+            self.wandb.log_table(key=f"test/class_iou/dataloaderr_idx_{str(i)}", columns=list(class_names), data=[class_iou])
         for i, test_acc in enumerate(self.test_acc): # reset
             test_acc.reset()
 
