@@ -301,87 +301,59 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
                  affine=True, track_running_stats=True):
         super().__init__(num_features, eps, momentum, affine, track_running_stats)
 
-    # def forward(self, input):
-    #     self._check_input_dim(input)
-        
-    #     # exponential_average_factor = 0.0
-
-    #     # if self.training and self.track_running_stats:
-    #     #     if self.num_batches_tracked is not None:
-    #     #         # self.num_batches_tracked.add_(1) # ! removed at Sept. 2022
-    #     #         if self.momentum is None:  # use cumulative moving average
-    #     #             exponential_average_factor = 1.0 / float(self.num_batches_tracked)
-    #     #         else:  # use exponential moving average
-    #     #             exponential_average_factor = self.momentum
-
-    #     # if batch_size > 1
-    #     # half_first = True
-    #     # if half_first == True:
-    #     #     if input.size(0) > 1:
-    #     #         mean_cur = (input[:1].mean([0, 2, 3]) + input[1:].mean([0, 2, 3])) / 2 # ! note that we should not use batch_size > 1
-    #     #         var_cur = (input[:1].var([0, 2, 3], unbiased=False) + input[1:].var([0, 2, 3], unbiased=False)) / 2
-    #     #     else:
-    #     #         mean_cur = input.mean([0, 2, 3])
-    #     #         var_cur = input.var([0, 2, 3], unbiased=False)
-    #     # else:
-    #     mean_cur = input.mean([0, 2, 3])
-    #     var_cur = input.var([0, 2, 3], unbiased=False)
-        
-        
-    #     if not hasattr(self, 'current_mean'):
-    #         self.register_buffer('current_mean', torch.zeros_like(self.running_mean))
-    #         self.register_buffer('current_var', torch.ones_like(self.running_var))
-    #     prior_ = 0.9
-    #     with torch.no_grad():
-    #         self.current_mean = prior_ * mean_cur + (1 - prior_) * self.current_mean
-    #         self.current_var = prior_ * var_cur + (1 - prior_) * self.current_var
-    #     # calculate running estimates
-    #     # n = input.numel() / input.size(1)
-    #     # if self.training:
-    #     #     mean, var = mean_cur, var_cur
-    #     #     with torch.no_grad():
-    #     #         self.running_mean = exponential_average_factor * mean\
-    #     #             + (1 - exponential_average_factor) * self.running_mean
-    #     mean = self.lambda_ * self.running_mean + (1-self.lambda_) * self.current_mean
-    #     var = self.lambda_ * self.running_var + (1-self.lambda_) * self.current_var
-    #     self.mean = mean.detach()
-    #     self.var = var.detach()
-    #     # normal train -> update running mean, var. use current mean, var
-    #     # target 
-    #     # eval -> use self.running_mean, self.running_var
-    #     # source + current 
-    #     input = (input - mean[None, :, None, None]) / (torch.sqrt(var[None, :, None, None] + self.eps))
-    #     if self.affine:
-    #         input = input * self.weight[None, :, None, None] + self.bias[None, :, None, None]
-    #     return input
-    
-    # TBR
     def forward(self, input):
         self._check_input_dim(input)
         
-        batch_mean = input.mean([0, 2, 3])
-        batch_std = torch.sqrt(input.var([0, 2, 3], unbiased=False) + self.eps)
+        # exponential_average_factor = 0.0
+
+        # if self.training and self.track_running_stats:
+        #     if self.num_batches_tracked is not None:
+        #         # self.num_batches_tracked.add_(1) # ! removed at Sept. 2022
+        #         if self.momentum is None:  # use cumulative moving average
+        #             exponential_average_factor = 1.0 / float(self.num_batches_tracked)
+        #         else:  # use exponential moving average
+        #             exponential_average_factor = self.momentum
+
+        # if batch_size > 1
+        # half_first = True
+        # if half_first == True:
+        #     if input.size(0) > 1:
+        #         mean_cur = (input[:1].mean([0, 2, 3]) + input[1:].mean([0, 2, 3])) / 2 # ! note that we should not use batch_size > 1
+        #         var_cur = (input[:1].var([0, 2, 3], unbiased=False) + input[1:].var([0, 2, 3], unbiased=False)) / 2
+        #     else:
+        #         mean_cur = input.mean([0, 2, 3])
+        #         var_cur = input.var([0, 2, 3], unbiased=False)
+        # else:
+        mean_cur = input.mean([0, 2, 3])
+        var_cur = input.var([0, 2, 3], unbiased=False)
         
-        # Compute r and d with stop-gradient
-        r = (batch_std.detach() / torch.sqrt(self.running_var + self.eps))
-        d = (batch_mean.detach() - self.running_mean) / torch.sqrt(self.running_var + self.eps)
-        
-        # Apply TBR norm
-        input_norm = (input - batch_mean[None, :, None, None]) / batch_std[None, :, None, None]
-        input_tbr = input_norm * r[None, :, None, None] + d[None, :, None, None]
-        
-        # Update EMA
-        self.running_mean = self.lambda_ * self.running_mean + (1 - self.lambda_) * batch_mean.detach()
-        self.running_var = self.lambda_ * self.running_var + (1 - self.lambda_) * torch.square(batch_std.detach())
-        
-        # For show statistic
-        self.mean = self.running_mean.detach()
-        self.var = self.running_var.detach()
-        
+        if not hasattr(self, 'current_mean'):
+            self.register_buffer('current_mean', torch.zeros_like(self.running_mean))
+            self.register_buffer('current_var', torch.ones_like(self.running_var))
+        prior_ = 0.5
+        self.current_mean = prior_ * mean_cur + (1 - prior_) * self.current_mean
+        self.current_var = prior_ * var_cur + (1 - prior_) * self.current_var
+        # calculate running estimates
+        # n = input.numel() / input.size(1)
+        # if self.training:
+        #     mean, var = mean_cur, var_cur
+        #     with torch.no_grad():
+        #         self.running_mean = exponential_average_factor * mean\
+        #             + (1 - exponential_average_factor) * self.running_mean
+        mean = self.lambda_ * self.running_mean + (1-self.lambda_) * self.current_mean
+        var = self.lambda_ * self.running_var + (1-self.lambda_) * self.current_var
+        # mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
+        # var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
+        self.mean = mean.detach()
+        self.var = var.detach()
+        # normal train -> update running mean, var. use current mean, var
+        # target 
+        # eval -> use self.running_mean, self.running_var
+        # source + current 
+        input = (input - mean[None, :, None, None]) / (torch.sqrt(var[None, :, None, None] + self.eps))
         if self.affine:
-            input_tbr = input_tbr * self.weight[None, :, None, None] + self.bias[None, :, None, None]
-            
-        return input_tbr
+            input = input * self.weight[None, :, None, None] + self.bias[None, :, None, None]
+        return input
     
     def from_bn(self, bn):
         self.__init__(
@@ -1664,7 +1636,7 @@ class DIGA(LightningModule):
         self.log(f"test/acc", acc, on_step=True, on_epoch=True, prog_bar=True, add_dataloader_idx=True)
         self.test_step_global += 1
         return {"loss": loss}
-    
+
     def forward_and_adapt(self, pair):
         """Forward and adapt model on batch of data.
         Measure entropy of the model prediction, take gradients, and update params.
@@ -1724,7 +1696,7 @@ class DIGA(LightningModule):
         plt.tight_layout()
         
         # Save plot to file
-        plt.savefig('batch_stats.png')
+        plt.savefig('bn_stats.png')
         plt.close()
         
         # Reset statistics
