@@ -19,7 +19,6 @@ class DIGA(nn.Module):
         self.fusion_lambda = cfg.model.fusion_lambda
         self.confidence_threshold = cfg.model.confidence_threshold
         self.proto_rho = cfg.model.proto_rho
-        self.prior_ = cfg.model.prior_
         
     def forward(self, x, is_source=True):
         # Extract features

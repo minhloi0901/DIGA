@@ -7,4 +7,5 @@ cfg:
   fusion_lambda: 0.8
   confidence_threshold: 0.9
   proto_rho: 0.1
-  prior_: 0.9
+  lambda_dot: 0.9
+  k-top: 10

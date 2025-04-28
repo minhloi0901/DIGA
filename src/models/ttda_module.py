@@ -326,13 +326,7 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
         # else:
         mean_cur = input.mean([0, 2, 3])
         var_cur = input.var([0, 2, 3], unbiased=False)
-        
-        if not hasattr(self, 'current_mean'):
-            self.register_buffer('current_mean', torch.zeros_like(self.running_mean))
-            self.register_buffer('current_var', torch.ones_like(self.running_var))
-        prior_ = 0.5
-        self.current_mean = prior_ * mean_cur + (1 - prior_) * self.current_mean
-        self.current_var = prior_ * var_cur + (1 - prior_) * self.current_var
+    
         # calculate running estimates
         # n = input.numel() / input.size(1)
         # if self.training:
@@ -340,8 +334,8 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
         #     with torch.no_grad():
         #         self.running_mean = exponential_average_factor * mean\
         #             + (1 - exponential_average_factor) * self.running_mean
-        mean = self.lambda_ * self.running_mean + (1-self.lambda_) * self.current_mean
-        var = self.lambda_ * self.running_var + (1-self.lambda_) * self.current_var
+        mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
+        var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
         # mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
         # var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
         self.mean = mean.detach()
@@ -1601,11 +1595,20 @@ class DIGA(LightningModule):
         self.forward_means = []
         self.forward_vars = []
         self.batch_indices = []
-
+        # DOT settings
+        self.num_classes = self.hparams.dataset_info['num_classes']
+        self.z_t = torch.ones(self.num_classes) / self.num_classes
+        print(f'[DIGA DEBUG] num_classes: {self.num_classes}')
+        self.lambda_dot = cfg.lambda_dot
+        
         self.save_hyperparameters(logger=False, ignore=["net"])
         self._replace_bn()
         self._configure_bn_running_stats()
-
+        
+        # Initialize statistics tracking
+        self._init_statistics_tracking()
+        self._init_batch_statistics_tracking()
+        
     # lightning callback
     def on_test_start(self):
         # metric to cpu
@@ -1618,17 +1621,64 @@ class DIGA(LightningModule):
             outputs = outputs[-1]
         return outputs
     
+    # DOT
+    def dot_loss(self, outputs):
+        """
+        Compute the DOT (Dynamic Online reweightTing) loss for a batch.
+        Args:
+            outputs: (B, C, H, W) logits
+        Returns:
+            loss: scalar tensor
+        """
+        logits_flat = outputs.mean(dim=(2, 3))
+
+        probs = torch.softmax(logits_flat, dim=1)
+        pred_classes = probs.argmax(dim=1)
+        B = probs.shape[0]
+        # entropy for each sample
+        logp = torch.log(probs + 1e-8)
+        entropys = -(probs * logp).sum(dim=1)
+        
+        # DOT weights
+        class_weight = 1. / (self.z_t + 1e-8)
+        class_weight = class_weight / class_weight.sum()
+        sample_weight = class_weight[pred_classes]
+        sample_weight = sample_weight / sample_weight.sum() * B
+        
+        ent_weight = torch.ones_like(sample_weight)
+
+        total_weight = sample_weight * ent_weight
+        use_idx = torch.ones_like(total_weight, dtype=torch.bool)
+        loss = (entropys * total_weight)[use_idx].mean()
+        print(f"[DIGA DEBUG] loss: {loss}")
+        # print("logits_flat", logits_flat)
+        # print("probs", probs)
+        # print("pred_classes", pred_classes)
+        # print("self.z_t", self.z_t)
+        # print("class_weight", class_weight)
+        # print("sample_weight", sample_weight)
+        # Update z_t
+        with torch.no_grad():
+            p_mean = probs.mean(dim=0)
+            self.z_t = self.lambda_dot * self.z_t + (1 - self.lambda_dot) * p_mean
+        return loss
+
     def step(self, batch: Any):
         x, y, shape_, name_ = batch
         target_size = y.shape[-2:]
         outputs, info, feature = self.forward_and_adapt((x,y))
         loss = torch.tensor(0.0, device=self.device)
         outputs = nn.Upsample(size=target_size, mode='bilinear')(outputs)
+        # loss = self.dot_loss(outputs)
         return loss.cpu(), outputs.cpu(), y.cpu(), info, feature
     
     def test_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
         x, y, shape_, name_ = batch
         loss, preds, targets, info, feature = self.step(batch)
+        
+        # Store features and labels for visualization
+        self.last_features = feature
+        self.last_labels = targets
         
         # log test metrics
         acc = self.test_acc[dataloader_idx](preds, targets)
@@ -1636,7 +1686,7 @@ class DIGA(LightningModule):
         self.log(f"test/acc", acc, on_step=True, on_epoch=True, prog_bar=True, add_dataloader_idx=True)
         self.test_step_global += 1
         return {"loss": loss}
-
+    
     def forward_and_adapt(self, pair):
         """Forward and adapt model on batch of data.
         Measure entropy of the model prediction, take gradients, and update params.
@@ -1658,51 +1708,23 @@ class DIGA(LightningModule):
             self.hparams.cfg,
         )
 
-        bn_means = []
-        bn_vars = []
-        for m in self.net.modules():
-            if isinstance(m, SIFABatchNorm2dTrainable):
-                mean_cur = m.mean.mean().item()
-                var_cur = m.var.mean().item() 
-                bn_means.append(mean_cur)
-                bn_vars.append(var_cur)
-        
-        if bn_means: 
-            self.forward_means.append(np.mean(bn_means))
-            self.forward_vars.append(np.mean(bn_vars))
-            self.batch_indices.append(self.test_step_global)
-
         outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs.softmax(1) * (1 - self.hparams.cfg.fusion_lambda)
         return outputs.cpu(), to_logs, feature
 
     def test_epoch_end(self, outputs: List[Any]):
-        plt.figure(figsize=(15, 10))
+        # Plot batch statistics
+        self._plot_batch_statistics()
         
-        if self.forward_means:  
-            plt.subplot(2, 2, 1)
-            plt.plot(self.batch_indices, self.forward_means, 'g-')
-            plt.title('SIFA BN Forward Step Mean over Batches')
-            plt.xlabel('Batch Index')
-            plt.ylabel('Mean')
-            plt.grid(True)
-            
-            plt.subplot(2, 2, 2)
-            plt.plot(self.batch_indices, self.forward_vars, 'm-')
-            plt.title('SIFA BN Forward Step Variance over Batches')
-            plt.xlabel('Batch Index')
-            plt.ylabel('Variance')
-            plt.grid(True)
+        # Create and save confident pixels plots
+        self._plot_confident_pixels_statistics()
         
-        plt.tight_layout()
+        # Calculate and print statistics
+        stats = self._calculate_overall_statistics()
+        self._print_statistics(stats)
         
-        # Save plot to file
-        plt.savefig('bn_stats.png')
-        plt.close()
-        
-        # Reset statistics
-        self.forward_means = []
-        self.forward_vars = []
-        self.batch_indices = []
+        # Reset all statistics for next epoch
+        self._init_statistics_tracking()
+        self._reset_batch_statistics()
         
         test_accs = [test_acc.compute() for test_acc in self.test_acc]
         acc_mean = sum(test_accs) / len(test_accs)
@@ -1717,10 +1739,85 @@ class DIGA(LightningModule):
             self.wandb.log_table(key=f"test/class_iou/dataloaderr_idx_{str(i)}", columns=list(class_names), data=[class_iou])
         for i, test_acc in enumerate(self.test_acc): # reset
             test_acc.reset()
-
+        
+    def _init_statistics_tracking(self):
+        """Initialize lists for tracking statistics across test images."""
+        self.confident_pixels_per_image = []
+        self.total_pixels_per_image = []
+        self.image_indices = []
+        
+    def _update_statistics(self, above_threshold: int, total_pixels: int):
+        """Update statistics for a single image.
+        
+        Args:
+            above_threshold: Number of pixels above confidence threshold
+            total_pixels: Total number of pixels in the image
+        """
+        self.confident_pixels_per_image.append(above_threshold)
+        self.total_pixels_per_image.append(total_pixels)
+        self.image_indices.append(len(self.image_indices))
+        
+    def _calculate_overall_statistics(self) -> dict:
+        """Calculate and return overall statistics.
+        
+        Returns:
+            Dictionary containing overall statistics
+        """
+        total_confident = sum(self.confident_pixels_per_image)
+        total_pixels = sum(self.total_pixels_per_image)
+        avg_percentage = total_confident / total_pixels * 100
+        
+        return {
+            'total_images': len(self.image_indices),
+            'avg_confident_pixels': total_confident/len(self.image_indices),
+            'avg_percentage': avg_percentage
+        }
+        
+    def _plot_confident_pixels_statistics(self):
+        """Create and save plots showing confident pixels statistics."""
+        plt.figure(figsize=(15, 5))
+        
+        # Plot 1: Number of confident pixels per image
+        plt.subplot(1, 2, 1)
+        plt.plot(self.image_indices, self.confident_pixels_per_image, 'b-', label='Confident Pixels')
+        plt.title('Number of Confident Pixels per Image')
+        plt.xlabel('Image Index')
+        plt.ylabel('Number of Pixels')
+        plt.grid(True)
+        
+        # Plot 2: Percentage of confident pixels per image
+        percentages = [conf/total*100 for conf, total in zip(self.confident_pixels_per_image, self.total_pixels_per_image)]
+        # store confident pixels and total pixels in csv 
+        with open('confident_pixels_statistics.csv', 'w') as f:
+            f.write('Image Index, Confident Pixels, Total Pixels\n')
+            for i, (conf, total) in enumerate(zip(self.confident_pixels_per_image, self.total_pixels_per_image)):
+                f.write(f'{i}, {conf}, {total}\n')
+        plt.subplot(1, 2, 2)
+        plt.plot(self.image_indices, percentages, 'r-', label='Percentage')
+        plt.title('Percentage of Confident Pixels per Image')
+        plt.xlabel('Image Index')
+        plt.ylabel('Percentage (%)')
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig('confident_pixels_statistics.png')
+        plt.close()
+        
+    def _print_statistics(self, stats: dict):
+        """Print statistics in a formatted way.
+        
+        Args:
+            stats: Dictionary containing statistics to print
+        """
+        print(f"\nOverall Statistics:")
+        print(f"Total number of images: {stats['total_images']}")
+        print(f"Average confident pixels per image: {stats['avg_confident_pixels']:.0f}")
+        print(f"Average percentage of confident pixels: {stats['avg_percentage']:.2f}%")
+        
     def high_confident_proto_label(self, outputs, threshold):
         """High confident pseudo label.
         For each pixel, output the max prob class if max_prob > bar, else 255
+        
         Args:
             outputs: (B, C, H, W), logits
             bar: float, threshold
@@ -1729,9 +1826,21 @@ class DIGA(LightningModule):
         Returns:
             pseudo_label: (B, H, W)
         """
+        # Convert logits to probabilities using softmax
         outputs = outputs.softmax(dim=1)
         pseudo_label = outputs.argmax(dim=1)
-        pseudo_label[outputs.max(dim=1)[0] < threshold] = 255
+        
+        # Calculate number of pixels above threshold for each image in the batch
+        max_probs = outputs.max(dim=1)[0]  # Shape: (B, H, W)
+        above_threshold = (max_probs > threshold).sum().item()  # Total across all images in batch
+        total_pixels = max_probs.numel()  # Total pixels across all images in batch
+        
+        # Update statistics
+        self._update_statistics(above_threshold, total_pixels)
+        
+        # Set pixels below threshold to 255
+        pseudo_label[max_probs < threshold] = 255
+        
         return pseudo_label
     
     def multi_proto_label(self, feature, outputs, y, class_names, cfg):
@@ -1899,83 +2008,213 @@ class DIGA(LightningModule):
                 return lg
         raise ValueError("No wandb logger found")
 
-class DomainOptimalTransport(nn.Module):
-    """Domain Optimal Transport (DOT) for feature alignment between source and target domains.
-    
-    This implements the DOT method from the DELTA paper, which uses optimal transport
-    to align feature distributions between source and target domains.
-    """
-    def __init__(self, num_features, eps=1e-5):
-        super().__init__()
-        self.num_features = num_features
-        self.eps = eps
-        
-        # Initialize source and target feature statistics
-        self.register_buffer('source_mean', torch.zeros(num_features))
-        self.register_buffer('source_var', torch.ones(num_features))
-        self.register_buffer('target_mean', torch.zeros(num_features))
-        self.register_buffer('target_var', torch.ones(num_features))
-        
-        # Initialize transport plan
-        self.register_buffer('transport_plan', torch.eye(num_features))
-        
-    def update_source_stats(self, features):
-        """Update source domain statistics."""
-        with torch.no_grad():
-            mean = features.mean([0, 2, 3])
-            var = features.var([0, 2, 3], unbiased=False)
-            self.source_mean = mean
-            self.source_var = var
+    def visualize_prototypes(self):
+        """Visualize the prototypes for each class using matplotlib.
+        Creates a grid of plots showing the feature dimensions for each class's prototype.
+        """
+        if not hasattr(self, "classifier_running_proto"):
+            print("No prototypes available yet")
+            return
             
-    def update_target_stats(self, features):
-        """Update target domain statistics."""
-        with torch.no_grad():
-            mean = features.mean([0, 2, 3])
-            var = features.var([0, 2, 3], unbiased=False)
-            self.target_mean = mean
-            self.target_var = var
-            
-    def compute_transport_plan(self):
-        """Compute optimal transport plan between source and target distributions."""
-        with torch.no_grad():
-            # Compute cost matrix using Mahalanobis distance
-            source_cov = torch.diag(self.source_var + self.eps)
-            target_cov = torch.diag(self.target_var + self.eps)
-            
-            # Compute Mahalanobis distance
-            diff = self.source_mean.unsqueeze(1) - self.target_mean.unsqueeze(0)
-            cost = torch.matmul(torch.matmul(diff.t(), torch.inverse(source_cov)), diff)
-            
-            # Solve optimal transport problem using Sinkhorn algorithm
-            self.transport_plan = self.sinkhorn(cost)
-            
-    def sinkhorn(self, cost, reg=0.1, max_iter=100):
-        """Sinkhorn algorithm for optimal transport."""
-        K = torch.exp(-cost / reg)
-        u = torch.ones_like(cost[:, 0])
-        v = torch.ones_like(cost[0, :])
+        proto = self.classifier_running_proto.cpu().numpy()
+        exists_flag = self.classifier_running_proto_exists_flag.cpu().numpy()
+        num_classes = proto.shape[0]
+        feature_dim = proto.shape[1]
         
-        for _ in range(max_iter):
-            u = 1.0 / (torch.matmul(K, v) + self.eps)
-            v = 1.0 / (torch.matmul(K.t(), u) + self.eps)
+        # Create a grid of subplots
+        n_cols = 4  # Number of columns in the grid
+        n_rows = (num_classes + n_cols - 1) // n_cols  # Calculate required rows
+        
+        plt.figure(figsize=(15, 4*n_rows))
+        
+        for i in range(num_classes):
+            plt.subplot(n_rows, n_cols, i+1)
             
-        return torch.diag(u) @ K @ torch.diag(v)
+            if exists_flag[i]:
+                # Plot the prototype features
+                plt.plot(proto[i], 'b-', label='Prototype')
+                plt.title(f'Class {i} ({self.hparams.dataset_info.class_names[i]})')
+                plt.grid(True)
+            else:
+                plt.text(0.5, 0.5, 'No prototype', 
+                        horizontalalignment='center',
+                        verticalalignment='center',
+                        transform=plt.gca().transAxes)
+                plt.title(f'Class {i} ({self.hparams.dataset_info.class_names[i]})')
+            
+            if i == 0:  # Only add legend to first plot
+                plt.legend()
         
-    def forward(self, features):
-        """Apply domain optimal transport to features."""
-        # Normalize features
-        features_norm = (features - self.source_mean[None, :, None, None]) / \
-                       torch.sqrt(self.source_var[None, :, None, None] + self.eps)
+        plt.tight_layout()
+        plt.savefig('prototypes.png')
+        plt.close()
+
+    def visualize_feature_clusters(self, features, labels, n_samples=1000):
+        """Visualize feature clusters using t-SNE.
+        Args:
+            features: [B, CH, H, W] feature tensor
+            labels: [B, H, W] label tensor
+            n_samples: number of samples to visualize (for performance)
+        """
+        # Move tensors to CPU
+        features = features.cpu()
+        labels = labels.cpu()
         
-        # Apply transport plan
-        features_trans = torch.matmul(features_norm.permute(0, 2, 3, 1), 
-                                    self.transport_plan).permute(0, 3, 1, 2)
+        # Get original shapes
+        B, CH, H, W = features.shape
         
-        # Denormalize with target statistics
-        features_adapted = features_trans * torch.sqrt(self.target_var[None, :, None, None] + self.eps) + \
-                         self.target_mean[None, :, None, None]
-                         
-        return features_adapted
+        # First sample points to reduce memory usage
+        total_points = B * H * W
+        if total_points > n_samples:
+            # Calculate sampling ratio
+            ratio = n_samples / total_points
+            # Sample indices
+            flat_indices = np.random.choice(total_points, n_samples, replace=False)
+            # Convert to 3D indices
+            b_idx = flat_indices // (H * W)
+            h_idx = (flat_indices % (H * W)) // W
+            w_idx = flat_indices % W
+            
+            # Sample features and labels
+            features = features[b_idx, :, h_idx, w_idx]  # [n_samples, CH]
+            labels = labels[b_idx, h_idx, w_idx]  # [n_samples]
+        else:
+            # Reshape if no sampling needed
+            features = features.permute(0, 2, 3, 1).reshape(-1, CH)  # [B*H*W, CH]
+            labels = labels.reshape(-1)  # [B*H*W]
+        
+        # Convert to numpy
+        features = features.numpy()
+        labels = labels.numpy()
+        
+        # Remove invalid labels (255)
+        valid_mask = labels != 255
+        features = features[valid_mask]
+        labels = labels[valid_mask]
+        
+        # Apply t-SNE
+        from sklearn.manifold import TSNE
+        tsne = TSNE(n_components=2, random_state=42)
+        features_2d = tsne.fit_transform(features)
+        
+        # Plot with class names
+        plt.figure(figsize=(15, 10))
+        
+        # Create scatter plot for each class
+        class_names = self.hparams.dataset_info.class_names
+        unique_labels = np.unique(labels)
+        
+        # Use a colormap that's distinct for many classes
+        colors = plt.cm.tab20(np.linspace(0, 1, len(class_names)))
+        
+        for idx, label in enumerate(unique_labels):
+            if label == 255:  # Skip invalid labels
+                continue
+            mask = labels == label
+            plt.scatter(features_2d[mask, 0], features_2d[mask, 1], 
+                       c=[colors[label]], label=class_names[label],
+                       alpha=0.6, s=50)
+        
+        plt.title('Feature Space Clusters (t-SNE)')
+        plt.xlabel('t-SNE 1')
+        plt.ylabel('t-SNE 2')
+        plt.grid(True)
+        
+        # Add legend outside of plot
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+        plt.tight_layout()
+        
+        plt.savefig('feature_clusters.png', bbox_inches='tight', dpi=300)
+        plt.close()
+
+    def visualize_prototype_distances(self):
+        """Visualize distances between prototypes as a heatmap.
+        """
+        if not hasattr(self, "classifier_running_proto"):
+            print("No prototypes available yet")
+            return
+            
+        proto = self.classifier_running_proto.cpu().numpy()
+        exists_flag = self.classifier_running_proto_exists_flag.cpu().numpy()
+        
+        # Calculate pairwise distances
+        from scipy.spatial.distance import pdist, squareform
+        distances = squareform(pdist(proto))
+        
+        # Create mask for non-existent prototypes
+        mask = np.zeros_like(distances, dtype=bool)
+        for i in range(len(exists_flag)):
+            for j in range(len(exists_flag)):
+                if not exists_flag[i] or not exists_flag[j]:
+                    mask[i, j] = True
+        
+        # Plot heatmap
+        plt.figure(figsize=(12, 10))
+        plt.imshow(distances, cmap='viridis')
+        plt.colorbar(label='Distance')
+        
+        # Add class names
+        class_names = self.hparams.dataset_info.class_names
+        plt.xticks(range(len(class_names)), class_names, rotation=45, ha='right')
+        plt.yticks(range(len(class_names)), class_names)
+        
+        # Add mask for non-existent prototypes
+        plt.imshow(mask, cmap='binary', alpha=0.3)
+        
+        plt.title('Prototype Pairwise Distances')
+        plt.tight_layout()
+        plt.savefig('prototype_distances.png')
+        plt.close()
+
+    def _init_batch_statistics_tracking(self):
+        """Initialize lists for tracking batch statistics."""
+        self.forward_means = []
+        self.forward_vars = []
+        self.batch_indices = []
+        
+    def _update_batch_statistics(self, mean: float, var: float):
+        """Update batch statistics.
+        
+        Args:
+            mean: Mean value for the current batch
+            var: Variance value for the current batch
+        """
+        self.forward_means.append(mean)
+        self.forward_vars.append(var)
+        self.batch_indices.append(len(self.batch_indices))
+        
+    def _plot_batch_statistics(self):
+        """Create and save plots showing batch statistics."""
+        if not self.forward_means:
+            return
+            
+        plt.figure(figsize=(15, 5))
+        
+        # Plot 1: Mean over batches
+        plt.subplot(1, 2, 1)
+        plt.plot(self.batch_indices, self.forward_means, 'g-', label='Mean')
+        plt.title('SIFA BN Forward Step Mean over Batches')
+        plt.xlabel('Batch Index')
+        plt.ylabel('Mean')
+        plt.grid(True)
+        
+        # Plot 2: Variance over batches
+        plt.subplot(1, 2, 2)
+        plt.plot(self.batch_indices, self.forward_vars, 'm-', label='Variance')
+        plt.title('SIFA BN Forward Step Variance over Batches')
+        plt.xlabel('Batch Index')
+        plt.ylabel('Variance')
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig('bn_stats.png')
+        plt.close()
+        
+    def _reset_batch_statistics(self):
+        """Reset batch statistics tracking."""
+        self.forward_means = []
+        self.forward_vars = []
+        self.batch_indices = []
 
 if __name__ == "__main__":
     import hydra
