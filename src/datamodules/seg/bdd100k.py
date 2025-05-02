@@ -183,7 +183,7 @@ def make_dataset(root, mode_input, maxSkip=0, cv_split=0):
     assert mode in ['train', 'val', 'test', 'trainval', 'small']
     img_path = os.path.join(root, 'images/10k') # TODO
     mask_path = os.path.join(root, 'labels/sem_seg/masks')
-    mask_postfix = '.png'
+    mask_postfix = '_train_id.png'
     # cv_splits = make_cv_splits(img_dir_name)
     if mode == 'trainval':
         modes = ['train', 'val']
@@ -263,49 +263,46 @@ class BDD100KDataSet(BaseDataset):
         # manually load image and mask
         img_path, mask_path = self.imgs[index]
         img, mask = Image.open(img_path).convert('RGB'), Image.open(mask_path)
-        # img, mask = self.get_image(img_path), self.get_labels(mask_path)
-        
-        
         img_name = os.path.splitext(os.path.basename(img_path))[0]
 
+        # Get original dimensions
+        w, h = img.size
+        
+        # Ensure landscape orientation (width > height)
+        if h > w:
+            img = img.transpose(Image.ROTATE_90)
+            mask = mask.transpose(Image.ROTATE_90)
+            w, h = h, w  # Swap dimensions
+        
+        # Calculate target dimensions maintaining aspect ratio
+        target_w = 1280  # Fixed width
+        target_h = int(h * (target_w / w))
+        
+        # Ensure height is divisible by 32
+        target_h = (target_h // 32) * 32
+        
+        # Resize both image and mask to target dimensions
+        img = img.resize((target_w, target_h), Image.BICUBIC)
+        mask = mask.resize((target_w, target_h), Image.NEAREST)
+        
+        # Convert mask to numpy array and process labels
         mask = np.array(mask)
         mask_copy = mask.copy()
         for k, v in trainid_to_trainid.items():
             mask_copy[mask == k] = v
 
-        # # manually load image and mask
-        # img, mask = Image.open(img_path).convert('RGB'), Image.open(mask_path)
-        # img, mask = np.array(img), np.array(mask)
-        # # mask *= 255
-        # img = img.astype(np.float32)
-
-
-        
-
-
-        # img_name = os.path.splitext(os.path.basename(img_path))[0]
-        # mask_copy = mask.copy()
-        # for k, v in trainid_to_trainid.items():
-        #     mask_copy[mask == k] = v
-        # img = np.array(img) * 255
-        img = np.array(img) - self.mean
-        
-
-        # transforms.Normalize(*self.mean_std)(tensor_img)
+        # Convert image to numpy array and normalize
+        img = np.array(img)
+        if self.mean is not None:
+            img = img - self.mean
 
         if self.eval_mode:
-            # to tensor
+            # Convert to tensor and normalize
             img = torch.from_numpy(img).float().permute(2, 0, 1)
-            # img = transforms.ToTensor()(img).float()
-            # img = transforms.Normalize(*self.mean_std)(img)
-            # mask_copy = (transforms.ToTensor()(mask_copy)).int().squeeze()
             mask_copy = torch.from_numpy(mask_copy).int().squeeze()
             return img, mask_copy, "", ""
-        # if self.eval_mode:
-        #     return [transforms.ToTensor()(img)], self._eval_get_item(img, mask_copy,
-        #                                                              self.eval_scales,
-        #                                                              self.eval_flip), img_name
         
+        # Convert mask back to PIL Image for transforms
         mask = Image.fromarray(mask_copy.astype(np.uint8))
 
         # Image Transformations
@@ -325,10 +322,7 @@ class BDD100KDataSet(BaseDataset):
             eps = 1e-5
             rgb_mean_std = ([torch.mean(img[0]), torch.mean(img[1]), torch.mean(img[2])],
                     [torch.std(img[0])+eps, torch.std(img[1])+eps, torch.std(img[2])+eps])
-        #img = transforms.Normalize(*rgb_mean_std)(img)
-
-        # img -= img.mean()
-        img -= self.mean
+        img = transforms.Normalize(*rgb_mean_std)(img)
 
         if self.target_aux_transform is not None:
             mask_aux = self.target_aux_transform(mask)

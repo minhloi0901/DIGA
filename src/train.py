@@ -14,6 +14,7 @@ import os
 root = pyrootutils.setup_root(__file__, dotenv=True, pythonpath=True)
 os.environ["UOUTDIR"] = "/kaggle/working/DIGA/output"
 os.environ["UDATADIR"] = "/kaggle/input/cityscape-diga"
+# os.environ["UDATADIR"] = "kaggle/input/bdd100"
 os.environ["PROJECT_ROOT"] = "/kaggle/working/DIGA"
 os.environ["WANDB_API_KEY"] = "e22d14a8d4b7c0b3fd491180f4b4eb0d6c5114a2"
 os.environ["NUM_WORKERS"] = "4"

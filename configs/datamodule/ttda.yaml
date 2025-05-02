@@ -4,8 +4,9 @@ defaults:
 _target_: src.datamodules.ttda_datamodule.Sim2RealSegmentationDataModule
 # data_dir: ${paths.data_dir}
 data_dir: /kaggle/input/cityscape-diga
+# data_dir: /kaggle/input/bdd100
 #batch_size: 1 # 64
-batch_size: 1
+batch_size: 4
 num_workers: ${oc.decode:${oc.env:NUM_WORKERS}}
 pin_memory: False
 train_list: # ! not used
@@ -28,8 +29,8 @@ val_list: # ! not used
 #   #   set: val # val
 #   # - _target_: src.datamodules.ttda_datamodule.GTA5DataSet
 #   # - _target_: src.datamodules.ttda_datamodule.CityscapesDataSet
-#   - _target_: src.datamodules.ttda_datamodule.BDD100KDataSet
+  # - _target_: src.datamodules.ttda_datamodule.BDD100KDataSet
 #   # - _target_: src.datamodules.ttda_datamodule.MapillaryDataSet
-#     _partial_: True
-#     set: val # val
+    # _partial_: True
+    # set: val # val
     

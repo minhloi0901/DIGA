@@ -296,10 +296,98 @@ class CustomBatchNorm2d(nn.BatchNorm2d):
         self.load_state_dict(bn.state_dict())
         return self
 
+class FeatureMemory(nn.Module):
+    """A class to manage feature memory bank with proper tensor handling."""
+    def __init__(self, max_size: int):
+        super().__init__()
+        self.max_size = max_size
+        self.register_buffer('memory', torch.zeros(0))
+        
+    def add(self, tensor: torch.Tensor):
+        """Add a tensor to memory with proper cloning and device handling."""
+        # Clone and detach the tensor
+        tensor = tensor.detach().clone()
+        
+        # Add to memory
+        if self.memory.numel() == 0:
+            # Initialize memory with the first tensor
+            self.memory = tensor.unsqueeze(0)
+        else:
+            # Ensure both tensors have the same number of dimensions
+            if self.memory.dim() == 1:
+                self.memory = self.memory.unsqueeze(0)
+            if tensor.dim() == 1:
+                tensor = tensor.unsqueeze(0)
+            self.memory = torch.cat([self.memory, tensor], dim=0)
+            
+    def remove(self, number: int, status: int = 0):
+        """Remove specified number of entries from memory bank.
+        
+        Args:
+            number: Number of entries to remove
+            status: Removal strategy (0: random, 1: oldest entries)
+        """
+        if self.memory.numel() == 0:
+            return
+            
+        if status == 0:  # Random removal
+            # Generate random indices
+            indices = torch.randperm(len(self))[:number].tolist()
+            # Sort indices in descending order to avoid index shifting
+            for idx in sorted(indices, reverse=True):
+                self.memory = torch.cat([self.memory[:idx], self.memory[idx+1:]])
+        else:  # status == 1, Remove oldest entries
+            # Remove oldest entries
+            self.memory = self.memory[number:]
+            
+    def get_stats(self) -> torch.Tensor:
+        """Get statistics (mean) from memory bank."""
+        if self.memory.numel() == 0:
+            return None
+            
+        return self.memory.mean(dim=0)
+        
+    def clear(self):
+        """Clear the memory bank."""
+        self.memory = torch.zeros(0, device=self.memory.device)
+        torch.cuda.empty_cache()
+        
+    def __len__(self):
+        return self.memory.size(0) if self.memory.numel() > 0 else 0
+
 class SIFABatchNorm2d(CustomBatchNorm2d):
     def __init__(self, num_features=0, eps=1e-5, momentum=0.1,
                  affine=True, track_running_stats=True):
         super().__init__(num_features, eps, momentum, affine, track_running_stats)
+
+    def update_memory_bank(self, input):
+        """Update memory banks with new batch statistics.
+        
+        Args:
+            input: [B, C, H, W]
+        """
+        batch_size = input.size(0)
+        # Remove if needed
+        if (len(self.mean_memory) + batch_size > self.memory_bank_size):
+            need_remove = len(self.mean_memory) + batch_size - self.memory_bank_size
+            self.mean_memory.remove(need_remove, status=0)
+            self.var_memory.remove(need_remove, status=0)
+        
+        # Calculate mean and var for each image in the batch
+        for i in range(batch_size):
+            # Calculate mean and var for this image
+            img_mean = input[i].mean([1, 2])  # [C]
+            img_var = input[i].var([1, 2], unbiased=False)  # [C]
+            # Add to memory banks
+            self.mean_memory.add(img_mean)
+            self.var_memory.add(img_var)
+
+    def get_memory_bank_stats(self):
+        """Calculate mean and variance from memory bank."""
+        mean_cur = self.mean_memory.get_stats()
+        var_cur = self.var_memory.get_stats()
+            
+        return mean_cur, var_cur
 
     def forward(self, input):
         self._check_input_dim(input)
@@ -324,9 +412,16 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
         #         mean_cur = input.mean([0, 2, 3])
         #         var_cur = input.var([0, 2, 3], unbiased=False)
         # else:
-        mean_cur = input.mean([0, 2, 3])
-        var_cur = input.var([0, 2, 3], unbiased=False)
-    
+        # mean_cur = input.mean([0, 2, 3])
+        # var_cur = input.var([0, 2, 3], unbiased=False)
+        
+        if not hasattr(self, 'mean_memory'):
+            self.mean_memory = FeatureMemory(self.memory_bank_size) 
+            self.var_memory = FeatureMemory(self.memory_bank_size) 
+            
+        # Update memory banks
+        self.update_memory_bank(input)
+        mean_cur, var_cur = self.get_memory_bank_stats()
         # calculate running estimates
         # n = input.numel() / input.size(1)
         # if self.training:
@@ -338,7 +433,7 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
         var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
         # mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
         # var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
-        self.mean = mean.detach()
+        self.mean = mean.detach() 
         self.var = var.detach()
         # normal train -> update running mean, var. use current mean, var
         # target 
@@ -1598,7 +1693,7 @@ class DIGA(LightningModule):
         # DOT settings
         self.num_classes = self.hparams.dataset_info['num_classes']
         self.z_t = torch.ones(self.num_classes) / self.num_classes
-        print(f'[DIGA DEBUG] num_classes: {self.num_classes}')
+        # print(f'[DIGA DEBUG] num_classes: {self.num_classes}')
         self.lambda_dot = cfg.lambda_dot
         
         self.save_hyperparameters(logger=False, ignore=["net"])
@@ -1609,6 +1704,11 @@ class DIGA(LightningModule):
         self._init_statistics_tracking()
         self._init_batch_statistics_tracking()
         
+        # Initialize class calculation counter
+        self.class_calculation_count = torch.zeros(self.num_classes, device=self.device)
+        # Initialize thresholds array
+        self.calculation_thresholds = torch.tensor([10, 100, 1000, 2500, 10000], device=self.device)
+    
     # lightning callback
     def on_test_start(self):
         # metric to cpu
@@ -1722,6 +1822,9 @@ class DIGA(LightningModule):
         stats = self._calculate_overall_statistics()
         self._print_statistics(stats)
         
+        # Calculate and print class balance statistics
+        self._print_class_balance_statistics()
+        
         # Reset all statistics for next epoch
         self._init_statistics_tracking()
         self._reset_batch_statistics()
@@ -1814,7 +1917,7 @@ class DIGA(LightningModule):
         print(f"Average confident pixels per image: {stats['avg_confident_pixels']:.0f}")
         print(f"Average percentage of confident pixels: {stats['avg_percentage']:.2f}%")
         
-    def high_confident_proto_label(self, outputs, threshold):
+    def high_confident_proto_label(self, outputs, threshold, number_of_prototypes):
         """High confident pseudo label.
         For each pixel, output the max prob class if max_prob > bar, else 255
         
@@ -1830,16 +1933,44 @@ class DIGA(LightningModule):
         outputs = outputs.softmax(dim=1)
         pseudo_label = outputs.argmax(dim=1)
         
+        # top2_probs, top2_indices = torch.topk(outputs, k=2, dim=1)
+        # conf_diff = top2_probs[:, 0] - top2_probs[:, 1]
         # Calculate number of pixels above threshold for each image in the batch
         max_probs = outputs.max(dim=1)[0]  # Shape: (B, H, W)
-        above_threshold = (max_probs > threshold).sum().item()  # Total across all images in batch
-        total_pixels = max_probs.numel()  # Total pixels across all images in batch
         
+        # Calculate number of pixels to keep per image
+        total_pixels_per_image = max_probs[0].numel()  # H * W
+        k_pixels = int(total_pixels_per_image * number_of_prototypes)  # Number of pixels to keep
+        
+        # Initialize mask for confident pixels
+        confident_mask = torch.zeros_like(max_probs, dtype=torch.bool)
+        
+        # Process each image in the batch for top-k pixels
+        for i in range(max_probs.shape[0]):
+            # Flatten probabilities for this image
+            flat_probs = max_probs[i].flatten()
+            
+            # Get indices of top k pixels
+            _, top_indices = torch.topk(flat_probs, k_pixels)
+            
+            # Create mask for this image
+            img_mask = torch.zeros_like(flat_probs, dtype=torch.bool)
+            img_mask[top_indices] = True
+            
+            # Reshape mask back to image dimensions
+            confident_mask[i] = img_mask.reshape(max_probs[i].shape)
+        
+        # Process confident pixels for smaller than threshold
+        confident_mask = confident_mask & (max_probs > threshold)
+        # confident_mask = confident_mask & (conf_diff > threshold)
+    
         # Update statistics
+        above_threshold = confident_mask.sum().item()
+        total_pixels = confident_mask.numel()
         self._update_statistics(above_threshold, total_pixels)
         
-        # Set pixels below threshold to 255
-        pseudo_label[max_probs < threshold] = 255
+        # Set non-confident pixels to 255
+        pseudo_label[~confident_mask] = 255
         
         return pseudo_label
     
@@ -1864,6 +1995,7 @@ class DIGA(LightningModule):
         proto_label = self.high_confident_proto_label(
             outputs, 
             threshold=cfg.confidence_threshold, 
+            number_of_prototypes=cfg.number_of_prototypes
         )
         proto, exists_flag = self.cal_proto(feature, proto_label)
         # init or update mean prototypes
@@ -1877,7 +2009,7 @@ class DIGA(LightningModule):
         multi_pred = cfg.proto_lambda * mean_pred + (1-cfg.proto_lambda) * instance_pred
         return multi_pred, to_logs
     
-    def cal_pred_of_proto(self, feature, proto, exists_flag, tau=1.0):
+    def cal_pred_of_proto(self, feature, proto, exists_flag, tau=2.0):
         """ Calculate the weight for classes of each pixel.
         For each pixel, we calculate the distance between the prototype of each class and the feature of the pixel.
         Then, we calculate the weight of each class by softmax with temperature tau.
@@ -1894,8 +2026,12 @@ class DIGA(LightningModule):
         # calculate distance
         feature = feature.unsqueeze(1) # [B, 1, CH, H, W]
         proto = proto.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) # [1, C, CH, 1, 1]
+        # feature_norm = feature / (feature.norm(dim=2, keepdim=True) + 1e-8)
+        # proto_norm = proto / (proto.norm(dim=2, keepdim=True) + 1e-8)
+        # cos_sim = torch.sum(feature_norm * proto_norm, dim=2)
+        # dist = 1 - cos_sim
         dist = torch.norm(proto - feature, dim=2) # [B, C, H, W]
-        # calculate weight
+        # calculate weight by softmax
         weight = torch.exp(-dist / tau) # [B, C, H, W]
         weight = weight * exists_flag.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) # [B, C, H, W]
         weight = weight / torch.sum(weight, dim=1, keepdim=True) # [B, C, H, W]
@@ -1929,8 +2065,30 @@ class DIGA(LightningModule):
                 classifier_proto[i] = proto[i]
                 classifier_proto_exists_flag[i] = 1
             else:
-                classifier_proto[i] = (1-rho) * classifier_proto[i] + rho * proto[i]
+                # Adjust rho based on calculation count
+                count = self.class_calculation_count[i]
+                # Find the position in thresholds array
+                pos = torch.sum(count > self.calculation_thresholds)
+                adjusted_rho = 0.5 - (pos * 0.1)  # Start from 0.5 and decrease by 0.1 for each threshold
+                adjusted_rho = max(adjusted_rho, 0.1)  # Ensure minimum rho is 0.1
+                classifier_proto[i] = (1-adjusted_rho) * classifier_proto[i] + adjusted_rho * proto[i]
+                self.class_calculation_count[i] += 1
         return classifier_proto, classifier_proto_exists_flag 
+
+    def fidelity(self, feature, proto):
+        """ Calculate the fidelity of the feature and the prototype.
+        Args:
+            feature: [B, CH, H, W]
+            proto: [C, CH]
+        Returns:
+            fidelity: [B, C, H, W]
+        """
+        feature_norm = feature / np.linalg.norm(feature, axis=1, keepdims=True)
+        proto_norm = proto / np.linalg.norm(proto, axis=1, keepdims=True)
+        
+        # Compute the fidelity
+        fidelity = (feature_norm @ proto_norm) ** 2
+        return fidelity
 
     @torch.no_grad()
     def proto_weight(self, proto, feature, tau=1.0):
@@ -1948,7 +2106,8 @@ class DIGA(LightningModule):
         # [B, C, CH, H, W]
         proto = proto.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
         feature = feature.unsqueeze(1)
-        dist = torch.norm(proto - feature, dim=2)
+        # dist = torch.norm(proto - feature, dim=2)
+        dist = self.fidelity(feature, proto)
         # calculate weight
         weight = torch.softmax(-dist / tau, dim=1)
         return weight
@@ -1976,8 +2135,10 @@ class DIGA(LightningModule):
     def _configure_bn_running_stats(self):
         """Configure model for use with eata."""
         for m in self.net.modules():
-            if isinstance(m, nn.BatchNorm2d):
+            # if isinstance(m, nn.BatchNorm2d):
+            if isinstance(m, SIFABatchNorm2d):
                 m.lambda_.data = torch.tensor(self.hparams.cfg.bn_lambda)
+                m.memory_bank_size = self.hparams.cfg.memory_bank_size
     
     def _replace_bn(self):
         """
@@ -2215,6 +2376,23 @@ class DIGA(LightningModule):
         self.forward_means = []
         self.forward_vars = []
         self.batch_indices = []
+    
+    def _print_class_balance_statistics(self):
+        """Save class balance statistics to a CSV file."""
+        import csv
+        
+        if hasattr(self, 'confident_class_counts'):
+            total_counts = torch.stack(self.confident_class_counts).sum(dim=0)
+            class_names = self.hparams.dataset_info.class_names
+            csv_path = "confident_class_balance.csv"
+            with open(csv_path, mode='w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['ClassName', 'ConfidentPixelCount'])
+                for i, count in enumerate(total_counts):
+                    class_name = class_names[i] if i < len(class_names) else str(i)
+                    writer.writerow([class_name, int(count.item())])
+            del self.confident_class_counts
+        
 
 if __name__ == "__main__":
     import hydra
