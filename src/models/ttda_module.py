@@ -392,28 +392,28 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
     def forward(self, input):
         self._check_input_dim(input)
         
-        # exponential_average_factor = 0.0
+        exponential_average_factor = 0.0
 
-        # if self.training and self.track_running_stats:
-        #     if self.num_batches_tracked is not None:
-        #         # self.num_batches_tracked.add_(1) # ! removed at Sept. 2022
-        #         if self.momentum is None:  # use cumulative moving average
-        #             exponential_average_factor = 1.0 / float(self.num_batches_tracked)
-        #         else:  # use exponential moving average
-        #             exponential_average_factor = self.momentum
+        if self.training and self.track_running_stats:
+            if self.num_batches_tracked is not None:
+                # self.num_batches_tracked.add_(1) # ! removed at Sept. 2022
+                if self.momentum is None:  # use cumulative moving average
+                    exponential_average_factor = 1.0 / float(self.num_batches_tracked)
+                else:  # use exponential moving average
+                    exponential_average_factor = self.momentum
 
         # if batch_size > 1
-        # half_first = True
-        # if half_first == True:
-        #     if input.size(0) > 1:
-        #         mean_cur = (input[:1].mean([0, 2, 3]) + input[1:].mean([0, 2, 3])) / 2 # ! note that we should not use batch_size > 1
-        #         var_cur = (input[:1].var([0, 2, 3], unbiased=False) + input[1:].var([0, 2, 3], unbiased=False)) / 2
-        #     else:
-        #         mean_cur = input.mean([0, 2, 3])
-        #         var_cur = input.var([0, 2, 3], unbiased=False)
-        # else:
-        # mean_cur = input.mean([0, 2, 3])
-        # var_cur = input.var([0, 2, 3], unbiased=False)
+        half_first = True
+        if half_first == True:
+            if input.size(0) > 1:
+                mean_cur = (input[:1].mean([0, 2, 3]) + input[1:].mean([0, 2, 3])) / 2 # ! note that we should not use batch_size > 1
+                var_cur = (input[:1].var([0, 2, 3], unbiased=False) + input[1:].var([0, 2, 3], unbiased=False)) / 2
+            else:
+                mean_cur = input.mean([0, 2, 3])
+                var_cur = input.var([0, 2, 3], unbiased=False)
+        else:
+            mean_cur = input.mean([0, 2, 3])
+            var_cur = input.var([0, 2, 3], unbiased=False)
         
         if not hasattr(self, 'mean_memory'):
             self.mean_memory = FeatureMemory(self.memory_bank_size) 
@@ -423,18 +423,17 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
         self.update_memory_bank(input)
         mean_cur, var_cur = self.get_memory_bank_stats()
         # calculate running estimates
-        # n = input.numel() / input.size(1)
-        # if self.training:
-        #     mean, var = mean_cur, var_cur
-        #     with torch.no_grad():
-        #         self.running_mean = exponential_average_factor * mean\
-        #             + (1 - exponential_average_factor) * self.running_mean
+        n = input.numel() / input.size(1)
+        if self.training:
+            mean, var = mean_cur, var_cur
+            with torch.no_grad():
+                self.running_mean = exponential_average_factor * mean\
+                    + (1 - exponential_average_factor) * self.running_mean
+                self.running_var = exponential_average_factor * var * n / (n - 1)\
+                    + (1 - exponential_average_factor) * self.running_var
+    
         mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
         var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
-        # mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
-        # var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
-        self.mean = mean.detach() 
-        self.var = var.detach()
         # normal train -> update running mean, var. use current mean, var
         # target 
         # eval -> use self.running_mean, self.running_var
@@ -1507,17 +1506,7 @@ class SegmentationBasicModule(LightningModule):
         acc = self.train_acc(preds, targets)
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train/acc", acc, on_step=True, on_epoch=True, prog_bar=True)
-        # if batch_idx % self.hparams.image_log_interval == 0:
-        # if batch_idx % 500 == 0:
-        # 	with torch.no_grad():
-        # 		elogger = SegmentationLogger(self, batch[0], targets, preds, loss, acc, self.hparams.dataset_info)
-        # 		for lg in self.loggers: 
-        # 			if "wandb" in lg.__module__:
-        # 				wandb = lg
-        # 				wandb.log_image(key="train/all_wrap", images=[elogger.all_wrap()])
-        # we can return here dict with any tensors
-        # and then read it in some callback or in `training_epoch_end()` below
-        # remember to always return loss from `training_step()` or else backpropagation will fail!
+    
         return {"loss": loss}
 
     def training_epoch_end(self, outputs: List[Any]):
@@ -1665,6 +1654,7 @@ class DIGA(LightningModule):
         net: torch.nn.Module,
         dataset_info: dict = {},
         cfg: object = None,
+        optimizer: torch.optim.Optimizer = None,
     ):
         super().__init__()
         self.save_hyperparameters(logger=False, ignore=["net"])
@@ -1673,42 +1663,88 @@ class DIGA(LightningModule):
             num_classes=self.hparams.dataset_info["num_classes"],
             output_size=self.hparams.dataset_info["image_size"],
         )
-        # loss function
-        self.criterion = torch.nn.CrossEntropyLoss()
-
         # use separate metric instance for train, val and test step
         # to ensure a proper reduction over the epoch
+        self.train_acc = SegmentationMetric(num_classes=self.hparams.dataset_info["num_classes"], ignore_index=255)
         self.test_acc = nn.ModuleList([SegmentationMetric(num_classes=self.hparams.dataset_info["num_classes"], ignore_index=255).cpu() for _ in self.hparams.dataset_info["test_list"]])
-
-        # for logging best so far validation accuracy
-        self.val_acc_best = MaxMetric()
         
         self.test_step_global = 0
         
-        # Track forward step mean and variance from SIFA BN layers
-        self.forward_means = []
-        self.forward_vars = []
-        self.batch_indices = []
-        # DOT settings
-        self.num_classes = self.hparams.dataset_info['num_classes']
-        self.z_t = torch.ones(self.num_classes) / self.num_classes
-        # print(f'[DIGA DEBUG] num_classes: {self.num_classes}')
-        self.lambda_dot = cfg.lambda_dot
-        
         self.save_hyperparameters(logger=False, ignore=["net"])
-        self._replace_bn()
-        self._configure_bn_running_stats()
-        
-        # Initialize statistics tracking
-        self._init_statistics_tracking()
-        self._init_batch_statistics_tracking()
+        # self._replace_bn()
+        # self._configure_bn_running_stats()
         
         # Initialize class calculation counter
         self.class_calculation_count = torch.zeros(self.num_classes, device=self.device)
         # Initialize thresholds array
         self.calculation_thresholds = torch.tensor([10, 100, 1000, 2500, 10000], device=self.device)
+        
+    def training_step(self, batch: Any, batch_idx, int):
+        x, y, shape_, name = batch
+        
+        outputs, _, feature = self.forward_and_adapt((x, y))
+        target_size = y.shape[-2:]
+        outputs = nn.Upsample(size=target_size, mode='bilinear')(outputs)
+        
+        pseudo_labels = self.high_confident_proto_label(
+            outputs, 
+            threshold=self.hparams.cfg.confidence_threshold, 
+            number_of_prototypes=self.hparams.cfg.number_of_prototypes
+        )
+        
+        loss = F.cross_entropy(outputs, pseudo_labels, ignore_index=255)
+        
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        return {"loss": loss}
+
+    def collect_params(self, model):
+        params = []
+        names = []
+        # collect only bn
+        for nm, m in model.named_modules():
+            if isinstance(m, SIFABatchNorm2d) or isinstance(m, SIFABatchNorm2dTrainable):
+                for np, p in m.named_parameters():
+                    if np in ["weight", "bias", "lambda_"]:
+                        params.append(p)
+                        names.append(f"{nm}.{np}")
+        return params, names
     
-    # lightning callback
+    def configure_optimizers(self):
+        """Configure optimizer and learning rate scheduler from config."""
+        if not hasattr(self.hparams, 'optimizer'):
+            return None
+            
+        # Get optimizer configuration from config
+        optimizer_config = self.hparams.optimizer
+        
+        # Collect parameters from model
+        params, names = self.collect_params(self.net)
+        
+        # Create optimizer with parameters from config
+        optimizer = torch.optim.SGD(
+            params=params,
+            lr=float(optimizer_config.lr),
+            momentum=float(optimizer_config.momentum),
+            weight_decay=float(optimizer_config.weight_decay)
+        )
+        
+        # Configure learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lambda step: (1 - step / 200000) ** 0.9  # from MaxSquareLoss paper
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            }
+        }
+        
+        return {"optimizer": optimizer}
+
     def on_test_start(self):
         # metric to cpu
         for metric in self.test_acc:
@@ -1720,68 +1756,20 @@ class DIGA(LightningModule):
             outputs = outputs[-1]
         return outputs
     
-    # DOT
-    def dot_loss(self, outputs):
-        """
-        Compute the DOT (Dynamic Online reweightTing) loss for a batch.
-        Args:
-            outputs: (B, C, H, W) logits
-        Returns:
-            loss: scalar tensor
-        """
-        logits_flat = outputs.mean(dim=(2, 3))
-
-        probs = torch.softmax(logits_flat, dim=1)
-        pred_classes = probs.argmax(dim=1)
-        B = probs.shape[0]
-        # entropy for each sample
-        logp = torch.log(probs + 1e-8)
-        entropys = -(probs * logp).sum(dim=1)
-        
-        # DOT weights
-        class_weight = 1. / (self.z_t + 1e-8)
-        class_weight = class_weight / class_weight.sum()
-        sample_weight = class_weight[pred_classes]
-        sample_weight = sample_weight / sample_weight.sum() * B
-        
-        ent_weight = torch.ones_like(sample_weight)
-
-        total_weight = sample_weight * ent_weight
-        use_idx = torch.ones_like(total_weight, dtype=torch.bool)
-        loss = (entropys * total_weight)[use_idx].mean()
-        print(f"[DIGA DEBUG] loss: {loss}")
-        # print("logits_flat", logits_flat)
-        # print("probs", probs)
-        # print("pred_classes", pred_classes)
-        # print("self.z_t", self.z_t)
-        # print("class_weight", class_weight)
-        # print("sample_weight", sample_weight)
-        # Update z_t
-        with torch.no_grad():
-            p_mean = probs.mean(dim=0)
-            self.z_t = self.lambda_dot * self.z_t + (1 - self.lambda_dot) * p_mean
-        return loss
 
     def step(self, batch: Any):
         x, y, shape_, name_ = batch
         target_size = y.shape[-2:]
         outputs, info, feature = self.forward_and_adapt((x,y))
-        entropy = softmax_entropy(outputs)
-        loss = entropy.mean()
+        loss = torch.tensor(0.0, device=self.device)
         outputs = nn.Upsample(size=target_size, mode='bilinear')(outputs)
         # loss = self.dot_loss(outputs)
         return loss.cpu(), outputs.cpu(), y.cpu(), info, feature
-    
+
     def test_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
         x, y, shape_, name_ = batch
-        
-        self.net.train()
-        
+
         loss, preds, targets, info, feature = self.step(batch)
-        
-        loss.backward()
-        self.optimizer.step()
-        self.optimizer.zero_grad()
         
         # Store features and labels for visualization
         self.last_features = feature
@@ -1795,15 +1783,9 @@ class DIGA(LightningModule):
         return {"loss": loss}
 
     def forward_and_adapt(self, pair):
-        """Forward and adapt model on batch of data.
-        Measure entropy of the model prediction, take gradients, and update params.
-        Return: 
-        1. model outputs; 
-        2. the number of reliable and non-redundant samples; 
-        3. the number of reliable samples;
-        4. the moving average  probability vector over all previous samples
-        """
+        """Forward and adapt model on batch of data."""
         x, y = pair
+        
         # no_grad
         feature, outputs = self.net(x, feat=True)
         
@@ -1817,7 +1799,7 @@ class DIGA(LightningModule):
         )
 
         outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs.softmax(1) * (1 - self.hparams.cfg.fusion_lambda)
-        return outputs.cpu(), to_logs, feature
+        return outputs, to_logs, feature
 
     def test_epoch_end(self, outputs: List[Any]):
         # Plot batch statistics
@@ -2083,21 +2065,6 @@ class DIGA(LightningModule):
                 self.class_calculation_count[i] += 1
         return classifier_proto, classifier_proto_exists_flag 
 
-    def fidelity(self, feature, proto):
-        """ Calculate the fidelity of the feature and the prototype.
-        Args:
-            feature: [B, CH, H, W]
-            proto: [C, CH]
-        Returns:
-            fidelity: [B, C, H, W]
-        """
-        feature_norm = feature / np.linalg.norm(feature, axis=1, keepdims=True)
-        proto_norm = proto / np.linalg.norm(proto, axis=1, keepdims=True)
-        
-        # Compute the fidelity
-        fidelity = (feature_norm @ proto_norm) ** 2
-        return fidelity
-
     @torch.no_grad()
     def proto_weight(self, proto, feature, tau=1.0):
         """ Calculate the weight for classes of each pixel.
@@ -2139,15 +2106,6 @@ class DIGA(LightningModule):
             proto[i] = feature.permute((1, 0, 2, 3)).flatten(1).permute((1,0))[masks].mean(0)
         return proto, with_flag
     
-    # utils operation
-    def _configure_bn_running_stats(self):
-        """Configure model for use with eata."""
-        for m in self.net.modules():
-            # if isinstance(m, nn.BatchNorm2d):
-            if isinstance(m, SIFABatchNorm2d):
-                m.lambda_.data = torch.tensor(self.hparams.cfg.bn_lambda)
-                m.memory_bank_size = self.hparams.cfg.memory_bank_size
-    
     def _replace_bn(self):
         """
         Replace all BN layers with new class for DIGA
@@ -2168,6 +2126,13 @@ class DIGA(LightningModule):
         for n, module in self.net.named_modules():
             if isinstance(module, nn.BatchNorm2d):
                 set_layer(self.net, n, SIFABatchNorm2dTrainable().from_bn(module).to(self.device))
+   
+    def _configure_bn_running_stats(self):
+        for m in self.net.modules():
+            # if isinstance(m, nn.BatchNorm2d):
+            if isinstance(m, SIFABatchNorm2d):
+                m.lambda_.data = torch.tensor(self.hparams.cfg.bn_lambda)
+                m.memory_bank_size = self.hparams.cfg.memory_bank_size
     
     # others
     @property
@@ -2176,243 +2141,6 @@ class DIGA(LightningModule):
             if "wandb" in lg.__module__:
                 return lg
         raise ValueError("No wandb logger found")
-
-    def visualize_prototypes(self):
-        """Visualize the prototypes for each class using matplotlib.
-        Creates a grid of plots showing the feature dimensions for each class's prototype.
-        """
-        if not hasattr(self, "classifier_running_proto"):
-            print("No prototypes available yet")
-            return
-            
-        proto = self.classifier_running_proto.cpu().numpy()
-        exists_flag = self.classifier_running_proto_exists_flag.cpu().numpy()
-        num_classes = proto.shape[0]
-        feature_dim = proto.shape[1]
-        
-        # Create a grid of subplots
-        n_cols = 4  # Number of columns in the grid
-        n_rows = (num_classes + n_cols - 1) // n_cols  # Calculate required rows
-        
-        plt.figure(figsize=(15, 4*n_rows))
-        
-        for i in range(num_classes):
-            plt.subplot(n_rows, n_cols, i+1)
-            
-            if exists_flag[i]:
-                # Plot the prototype features
-                plt.plot(proto[i], 'b-', label='Prototype')
-                plt.title(f'Class {i} ({self.hparams.dataset_info.class_names[i]})')
-                plt.grid(True)
-            else:
-                plt.text(0.5, 0.5, 'No prototype', 
-                        horizontalalignment='center',
-                        verticalalignment='center',
-                        transform=plt.gca().transAxes)
-                plt.title(f'Class {i} ({self.hparams.dataset_info.class_names[i]})')
-            
-            if i == 0:  # Only add legend to first plot
-                plt.legend()
-        
-        plt.tight_layout()
-        plt.savefig('prototypes.png')
-        plt.close()
-
-    def visualize_feature_clusters(self, features, labels, n_samples=1000):
-        """Visualize feature clusters using t-SNE.
-        Args:
-            features: [B, CH, H, W] feature tensor
-            labels: [B, H, W] label tensor
-            n_samples: number of samples to visualize (for performance)
-        """
-        # Move tensors to CPU
-        features = features.cpu()
-        labels = labels.cpu()
-        
-        # Get original shapes
-        B, CH, H, W = features.shape
-        
-        # First sample points to reduce memory usage
-        total_points = B * H * W
-        if total_points > n_samples:
-            # Calculate sampling ratio
-            ratio = n_samples / total_points
-            # Sample indices
-            flat_indices = np.random.choice(total_points, n_samples, replace=False)
-            # Convert to 3D indices
-            b_idx = flat_indices // (H * W)
-            h_idx = (flat_indices % (H * W)) // W
-            w_idx = flat_indices % W
-            
-            # Sample features and labels
-            features = features[b_idx, :, h_idx, w_idx]  # [n_samples, CH]
-            labels = labels[b_idx, h_idx, w_idx]  # [n_samples]
-        else:
-            # Reshape if no sampling needed
-            features = features.permute(0, 2, 3, 1).reshape(-1, CH)  # [B*H*W, CH]
-            labels = labels.reshape(-1)  # [B*H*W]
-        
-        # Convert to numpy
-        features = features.numpy()
-        labels = labels.numpy()
-        
-        # Remove invalid labels (255)
-        valid_mask = labels != 255
-        features = features[valid_mask]
-        labels = labels[valid_mask]
-        
-        # Apply t-SNE
-        from sklearn.manifold import TSNE
-        tsne = TSNE(n_components=2, random_state=42)
-        features_2d = tsne.fit_transform(features)
-        
-        # Plot with class names
-        plt.figure(figsize=(15, 10))
-        
-        # Create scatter plot for each class
-        class_names = self.hparams.dataset_info.class_names
-        unique_labels = np.unique(labels)
-        
-        # Use a colormap that's distinct for many classes
-        colors = plt.cm.tab20(np.linspace(0, 1, len(class_names)))
-        
-        for idx, label in enumerate(unique_labels):
-            if label == 255:  # Skip invalid labels
-                continue
-            mask = labels == label
-            plt.scatter(features_2d[mask, 0], features_2d[mask, 1], 
-                       c=[colors[label]], label=class_names[label],
-                       alpha=0.6, s=50)
-        
-        plt.title('Feature Space Clusters (t-SNE)')
-        plt.xlabel('t-SNE 1')
-        plt.ylabel('t-SNE 2')
-        plt.grid(True)
-        
-        # Add legend outside of plot
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
-        plt.tight_layout()
-        
-        plt.savefig('feature_clusters.png', bbox_inches='tight', dpi=300)
-        plt.close()
-
-    def visualize_prototype_distances(self):
-        """Visualize distances between prototypes as a heatmap.
-        """
-        if not hasattr(self, "classifier_running_proto"):
-            print("No prototypes available yet")
-            return
-            
-        proto = self.classifier_running_proto.cpu().numpy()
-        exists_flag = self.classifier_running_proto_exists_flag.cpu().numpy()
-        
-        # Calculate pairwise distances
-        from scipy.spatial.distance import pdist, squareform
-        distances = squareform(pdist(proto))
-        
-        # Create mask for non-existent prototypes
-        mask = np.zeros_like(distances, dtype=bool)
-        for i in range(len(exists_flag)):
-            for j in range(len(exists_flag)):
-                if not exists_flag[i] or not exists_flag[j]:
-                    mask[i, j] = True
-        
-        # Plot heatmap
-        plt.figure(figsize=(12, 10))
-        plt.imshow(distances, cmap='viridis')
-        plt.colorbar(label='Distance')
-        
-        # Add class names
-        class_names = self.hparams.dataset_info.class_names
-        plt.xticks(range(len(class_names)), class_names, rotation=45, ha='right')
-        plt.yticks(range(len(class_names)), class_names)
-        
-        # Add mask for non-existent prototypes
-        plt.imshow(mask, cmap='binary', alpha=0.3)
-        
-        plt.title('Prototype Pairwise Distances')
-        plt.tight_layout()
-        plt.savefig('prototype_distances.png')
-        plt.close()
-
-    def _init_batch_statistics_tracking(self):
-        """Initialize lists for tracking batch statistics."""
-        self.forward_means = []
-        self.forward_vars = []
-        self.batch_indices = []
-        
-    def _update_batch_statistics(self, mean: float, var: float):
-        """Update batch statistics.
-        
-        Args:
-            mean: Mean value for the current batch
-            var: Variance value for the current batch
-        """
-        self.forward_means.append(mean)
-        self.forward_vars.append(var)
-        self.batch_indices.append(len(self.batch_indices))
-        
-    def _plot_batch_statistics(self):
-        """Create and save plots showing batch statistics."""
-        if not self.forward_means:
-            return
-            
-        plt.figure(figsize=(15, 5))
-        
-        # Plot 1: Mean over batches
-        plt.subplot(1, 2, 1)
-        plt.plot(self.batch_indices, self.forward_means, 'g-', label='Mean')
-        plt.title('SIFA BN Forward Step Mean over Batches')
-        plt.xlabel('Batch Index')
-        plt.ylabel('Mean')
-        plt.grid(True)
-        
-        # Plot 2: Variance over batches
-        plt.subplot(1, 2, 2)
-        plt.plot(self.batch_indices, self.forward_vars, 'm-', label='Variance')
-        plt.title('SIFA BN Forward Step Variance over Batches')
-        plt.xlabel('Batch Index')
-        plt.ylabel('Variance')
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig('bn_stats.png')
-        plt.close()
-        
-    def _reset_batch_statistics(self):
-        """Reset batch statistics tracking."""
-        self.forward_means = []
-        self.forward_vars = []
-        self.batch_indices = []
-    
-    def _print_class_balance_statistics(self):
-        """Save class balance statistics to a CSV file."""
-        import csv
-        
-        if hasattr(self, 'confident_class_counts'):
-            total_counts = torch.stack(self.confident_class_counts).sum(dim=0)
-            class_names = self.hparams.dataset_info.class_names
-            csv_path = "confident_class_balance.csv"
-            with open(csv_path, mode='w', newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(['ClassName', 'ConfidentPixelCount'])
-                for i, count in enumerate(total_counts):
-                    class_name = class_names[i] if i < len(class_names) else str(i)
-                    writer.writerow([class_name, int(count.item())])
-            del self.confident_class_counts
-        
-    def configure_optimizers(self):
-        """Configure optimizer for test-time training."""
-        optimizer = self.hparams.tt_optimizer
-        
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": self.hparams.tt_lr_scheduler,
-                "interval": "step", 
-                "frequency": 1
-            }
-        }
 
 if __name__ == "__main__":
     import hydra
