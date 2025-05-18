@@ -1673,7 +1673,6 @@ class DIGA(LightningModule):
             num_classes=self.hparams.dataset_info["num_classes"],
             output_size=self.hparams.dataset_info["image_size"],
         )
-
         # loss function
         self.criterion = torch.nn.CrossEntropyLoss()
 
@@ -1767,14 +1766,22 @@ class DIGA(LightningModule):
         x, y, shape_, name_ = batch
         target_size = y.shape[-2:]
         outputs, info, feature = self.forward_and_adapt((x,y))
-        loss = torch.tensor(0.0, device=self.device)
+        entropy = softmax_entropy(outputs)
+        loss = entropy.mean()
         outputs = nn.Upsample(size=target_size, mode='bilinear')(outputs)
         # loss = self.dot_loss(outputs)
         return loss.cpu(), outputs.cpu(), y.cpu(), info, feature
     
     def test_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
         x, y, shape_, name_ = batch
+        
+        self.net.train()
+        
         loss, preds, targets, info, feature = self.step(batch)
+        
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
         
         # Store features and labels for visualization
         self.last_features = feature
@@ -1786,7 +1793,7 @@ class DIGA(LightningModule):
         self.log(f"test/acc", acc, on_step=True, on_epoch=True, prog_bar=True, add_dataloader_idx=True)
         self.test_step_global += 1
         return {"loss": loss}
-    
+
     def forward_and_adapt(self, pair):
         """Forward and adapt model on batch of data.
         Measure entropy of the model prediction, take gradients, and update params.
@@ -1799,6 +1806,7 @@ class DIGA(LightningModule):
         x, y = pair
         # no_grad
         feature, outputs = self.net(x, feat=True)
+        
         to_logs = {}
         outputs_proto, to_logs_ = self.multi_proto_label(
             feature,
@@ -2106,8 +2114,8 @@ class DIGA(LightningModule):
         # [B, C, CH, H, W]
         proto = proto.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
         feature = feature.unsqueeze(1)
-        # dist = torch.norm(proto - feature, dim=2)
-        dist = self.fidelity(feature, proto)
+        dist = torch.norm(proto - feature, dim=2)
+        # dist = self.fidelity(feature, proto)
         # calculate weight
         weight = torch.softmax(-dist / tau, dim=1)
         return weight
@@ -2393,6 +2401,18 @@ class DIGA(LightningModule):
                     writer.writerow([class_name, int(count.item())])
             del self.confident_class_counts
         
+    def configure_optimizers(self):
+        """Configure optimizer for test-time training."""
+        optimizer = self.hparams.tt_optimizer
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": self.hparams.tt_lr_scheduler,
+                "interval": "step", 
+                "frequency": 1
+            }
+        }
 
 if __name__ == "__main__":
     import hydra
