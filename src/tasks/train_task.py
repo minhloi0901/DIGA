@@ -31,7 +31,7 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
 
     log.info(f"Instantiating datamodule <{cfg.datamodule._target_}>")
     datamodule: LightningDataModule = hydra.utils.instantiate(cfg.datamodule)
-
+    print('datamodule instantiated')
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: LightningModule = hydra.utils.instantiate(cfg.model, dataset_info=datamodule.info)
 
