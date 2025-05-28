@@ -10,6 +10,7 @@ cfg:
   proto_rho: 0.4 # best
   lambda_dot: 0.9
   memory_bank_size: 32
+  loss_name: iou
 optimizer:
   lr: 0.001
   momentum: 0.9

@@ -403,17 +403,17 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
                     exponential_average_factor = self.momentum
 
         # if batch_size > 1
-        half_first = True
-        if half_first == True:
-            if input.size(0) > 1:
-                mean_cur = (input[:1].mean([0, 2, 3]) + input[1:].mean([0, 2, 3])) / 2 # ! note that we should not use batch_size > 1
-                var_cur = (input[:1].var([0, 2, 3], unbiased=False) + input[1:].var([0, 2, 3], unbiased=False)) / 2
-            else:
-                mean_cur = input.mean([0, 2, 3])
-                var_cur = input.var([0, 2, 3], unbiased=False)
-        else:
-            mean_cur = input.mean([0, 2, 3])
-            var_cur = input.var([0, 2, 3], unbiased=False)
+        # half_first = True
+        # if half_first == True:
+        #     if input.size(0) > 1:
+        #         mean_cur = (input[:1].mean([0, 2, 3]) + input[1:].mean([0, 2, 3])) / 2 # ! note that we should not use batch_size > 1
+        #         var_cur = (input[:1].var([0, 2, 3], unbiased=False) + input[1:].var([0, 2, 3], unbiased=False)) / 2
+        #     else:
+        #         mean_cur = input.mean([0, 2, 3])
+        #         var_cur = input.var([0, 2, 3], unbiased=False)
+        # else:
+        mean_cur = input.mean([0, 2, 3])
+        var_cur = input.var([0, 2, 3], unbiased=False)
         
         if not hasattr(self, 'mean_memory'):
             self.mean_memory = FeatureMemory(self.memory_bank_size) 
@@ -1757,20 +1757,35 @@ class DIGA(LightningModule):
             outputs = outputs[-1]
         return outputs
     
-
+    def get_pseudolabeling_loss(self, mask_pred_tensor_raw, loss_name='iou'):
+        gt_mask_ce = mask_pred_tensor_raw.detach().argmax(dim=1, keepdim=True)
+        
+        gt_mask_iou = torch.zeros_like(mask_pred_tensor_raw)
+        gt_mask_iou.scatter_(1, gt_mask_ce, 1)
+        
+        if loss_name == 'iou':
+            loss = iou_loss(mask_pred_tensor_raw, gt_mask_iou, apply_softmax=True, reduction='none')
+        elif loss_name == 'ce':
+            loss = torch.nn.functional.cross_entropy(mask_pred_tensor_raw, gt_mask_ce.squeeze(1), reduction='none')
+            loss = loss.mean(dim=(1, 2))        
+        return loss, gt_mask_ce.detach().cpu()
+            
     def step(self, batch: Any):
         x, y, shape_, name_ = batch
         target_size = y.shape[-2:]
-        outputs, info, feature = self.forward_and_adapt((x,y))
-        loss = torch.tensor(0.0, device=self.device)
+        outputs, info, feature, loss = self.forward_and_adapt((x,y))
+        
+        
+        # loss_seg, pm = self.get_pseudolabelling_loss(preds_seg_it_raw, loss_name=self.hparams.cfg.loss_name)
         outputs = nn.Upsample(size=target_size, mode='bilinear')(outputs)
         # loss = self.dot_loss(outputs)
-        return loss.cpu(), outputs.cpu(), y.cpu(), info, feature
+        return loss.cpu(), outputs.cpu(), y.cpu(), info, feature, loss
 
     def test_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
         x, y, shape_, name_ = batch
-
-        loss, preds, targets, info, feature = self.step(batch)
+        
+        # Forward and adapt
+        loss, preds, targets, info, feature, loss = self.step(batch)
         
         # Store features and labels for visualization
         self.last_features = feature
@@ -1781,6 +1796,7 @@ class DIGA(LightningModule):
         self.log(f"test/loss", loss, on_step=True, on_epoch=True, prog_bar=False, add_dataloader_idx=True)
         self.log(f"test/acc", acc, on_step=True, on_epoch=True, prog_bar=True, add_dataloader_idx=True)
         self.test_step_global += 1
+        
         return {"loss": loss}
 
     def forward_and_adapt(self, pair):
@@ -1799,8 +1815,17 @@ class DIGA(LightningModule):
             self.hparams.cfg,
         )
 
-        outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs.softmax(1) * (1 - self.hparams.cfg.fusion_lambda)
-        return outputs, to_logs, feature
+        # outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs.softmax(1) * (1 - self.hparams.cfg.
+        # fusion_lambda)
+        outputs_softmax = outputs.softmax(1)
+        fused_outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs_softmax * (1 - self.hparams.cfg.fusion_lambda)
+        
+        # Calculate cross-entropy loss where:
+        # - outputs is the model prediction to be learned
+        # - fused_outputs.argmax(1) is the pseudo label from prototype
+        loss = cross_entropy_2d(outputs, fused_outputs.argmax(1))
+        
+        return fused_outputs, to_logs, feature, loss
 
     def test_epoch_end(self, outputs: List[Any]): 
         # Calculate and print statistics
