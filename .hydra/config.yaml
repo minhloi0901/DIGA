@@ -1,0 +1,106 @@
+task_name: test-time-DA
+tags:
+- ttda
+- coding
+train: true
+test: false
+ckpt_path: null
+seed: 55555
+datamodule:
+  test_list:
+  - _target_: src.datamodules.ttda_datamodule.CityscapesDataSet
+    _partial_: true
+    set: val
+  _target_: src.datamodules.ttda_datamodule.Sim2RealSegmentationDataModule
+  data_dir: ${paths.data_dir}
+  batch_size: 1
+  num_workers: ${oc.decode:${oc.env:NUM_WORKERS}}
+  pin_memory: false
+  train_list:
+  - _target_: src.datamodules.ttda_datamodule.CityscapesDataSet
+    _partial_: true
+    set: val
+  val_list:
+  - _target_: src.datamodules.ttda_datamodule.CityscapesDataSet
+    _partial_: true
+    set: val
+model:
+  net:
+    _target_: src.models.ttda_module.DeepLabv2AdaptSeg
+    _partial_: true
+    multi_level: true
+    restore_from: ${paths.data_dir}/models/DA_Seg_models/GTA5/GTA5_baseline.pth
+  _target_: src.models.ttda_module.DIGA
+  cfg:
+    bn_lambda: 0.8
+    proto_lambda: 0.8
+    fusion_lambda: 0.8
+    confidence_threshold: 0.9
+    number_of_prototypes: 0.7
+    proto_rho: 0.4
+    lambda_dot: 0.9
+    memory_bank_size: 32
+    loss_name: iou
+  optimizer:
+    lr: 0.001
+    momentum: 0.9
+    weight_decay: 0.0005
+callbacks:
+  model_checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: epoch_{epoch:03d}
+    monitor: val/acc
+    verbose: false
+    save_last: true
+    save_top_k: 1
+    mode: max
+    auto_insert_metric_name: false
+    save_weights_only: false
+    every_n_train_steps: null
+    train_time_interval: null
+    every_n_epochs: null
+    save_on_train_epoch_end: null
+  early_stopping: null
+  model_summary:
+    _target_: pytorch_lightning.callbacks.RichModelSummary
+    max_depth: -1
+  rich_progress_bar:
+    _target_: pytorch_lightning.callbacks.RichProgressBar
+logger:
+  wandb:
+    _target_: pytorch_lightning.loggers.wandb.WandbLogger
+    save_dir: ${paths.log_dir}/wandb/${task_name}
+    id: null
+    anonymous: null
+    project: ${task_name}
+    log_model: false
+    prefix: ''
+    group: debug
+    tags: ${tags}
+    job_type: ''
+trainer:
+  _target_: pytorch_lightning.Trainer
+  default_root_dir: ${paths.output_dir}
+  min_epochs: 1
+  max_epochs: 1
+  accelerator: gpu
+  devices: 2
+  move_metrics_to_cpu: true
+  precision: 32
+  deterministic: false
+  strategy: ddp
+  num_nodes: 1
+  sync_batchnorm: true
+  log_every_n_steps: 1
+  num_sanity_val_steps: 0
+paths:
+  root_dir: ${oc.env:PROJECT_ROOT}
+  data_dir: ${oc.env:UDATADIR}
+  log_dir: ${oc.env:UOUTDIR}/plightning/log
+  output_dir: ${hydra:runtime.output_dir}
+  work_dir: ${hydra:runtime.cwd}
+extras:
+  ignore_warnings: false
+  enforce_tags: true
+  print_config: true

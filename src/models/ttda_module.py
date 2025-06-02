@@ -25,6 +25,8 @@ import random
 from tqdm import tqdm
 import time 
 import matplotlib.pyplot as plt
+import os 
+import json
 
 logger = logging.getLogger('lightning')
 logging.getLogger('PIL').setLevel(logging.INFO)
@@ -69,7 +71,7 @@ class SegmentationLogger:
     """TODO check no grad"""
     IMAGE_SIZE = (100, 100)
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def __init__(self, model, data, targets, preds, loss, acc, dataset_info={}, plot_limit=5):
         batch_size = targets.shape[0]
         self.model = model
@@ -111,7 +113,7 @@ class SegmentationLogger:
         segs = [seg[i] for i in range(seg.shape[0])]
         return make_grid([self._add_seg(imgs[i], segs[i]) for i in range(self.plot_limit)], nrow=self.plot_limit, normalize=True)
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def _add_seg(self, img, seg):
         """visulize image with segmentation mask with draw_segmentation_masks
         img: [3, H, W]
@@ -267,12 +269,12 @@ class CustomBatchNorm2d(nn.BatchNorm2d):
             # use biased var in train
             var = input.var([0, 2, 3], unbiased=False)
             n = input.numel() / input.size(1)
-            with torch.no_grad():
-                self.running_mean = exponential_average_factor * mean\
-                    + (1 - exponential_average_factor) * self.running_mean
-                # update running_var with unbiased var
-                self.running_var = exponential_average_factor * var * n / (n - 1)\
-                    + (1 - exponential_average_factor) * self.running_var
+            # with torch.no_grad():
+            self.running_mean = exponential_average_factor * mean\
+                + (1 - exponential_average_factor) * self.running_mean
+            # update running_var with unbiased var
+            self.running_var = exponential_average_factor * var * n / (n - 1)\
+                + (1 - exponential_average_factor) * self.running_var
         else:
             mean = self.running_mean
             var = self.running_var
@@ -391,16 +393,16 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
 
     def forward(self, input):
         self._check_input_dim(input)
-        
+
         exponential_average_factor = 0.0
 
-        if self.training and self.track_running_stats:
-            if self.num_batches_tracked is not None:
-                # self.num_batches_tracked.add_(1) # ! removed at Sept. 2022
-                if self.momentum is None:  # use cumulative moving average
-                    exponential_average_factor = 1.0 / float(self.num_batches_tracked)
-                else:  # use exponential moving average
-                    exponential_average_factor = self.momentum
+        # if self.training and self.track_running_stats:
+        #     if self.num_batches_tracked is not None:
+        #         # self.num_batches_tracked.add_(1) # ! removed at Sept. 2022
+        #         if self.momentum is None:  # use cumulative moving average
+        #             exponential_average_factor = 1.0 / float(self.num_batches_tracked)
+        #         else:  # use exponential moving average
+        #             exponential_average_factor = self.momentum
 
         # if batch_size > 1
         # half_first = True
@@ -418,20 +420,20 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
         if not hasattr(self, 'mean_memory'):
             self.mean_memory = FeatureMemory(self.memory_bank_size) 
             self.var_memory = FeatureMemory(self.memory_bank_size) 
-            
+        
         # Update memory banks
         self.update_memory_bank(input)
         mean_cur, var_cur = self.get_memory_bank_stats()
+        
         # calculate running estimates
         n = input.numel() / input.size(1)
-        if self.training:
-            mean, var = mean_cur, var_cur
-            with torch.no_grad():
-                self.running_mean = exponential_average_factor * mean\
-                    + (1 - exponential_average_factor) * self.running_mean
-                self.running_var = exponential_average_factor * var * n / (n - 1)\
-                    + (1 - exponential_average_factor) * self.running_var
-    
+        # if self.training:
+        #     mean, var = mean_cur, var_cur
+        #     with torch.no_grad():
+        #         self.running_mean = exponential_average_factor * mean\
+        #             + (1 - exponential_average_factor) * self.running_mean
+        #         self.running_var = exponential_average_factor * var * n / (n - 1)\
+        #             + (1 - exponential_average_factor) * self.running_var
         mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
         var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
         # normal train -> update running mean, var. use current mean, var
@@ -526,18 +528,18 @@ class SourceTargetMeanBatchNorm2d(CustomBatchNorm2d):
             # linear combination of self.source_mean, self.source_var and self.running_mean, self.running_var
             exponential_average_factor = self.momentum
             mean, var = mean_cur, var_cur
-            with torch.no_grad():
+            # with torch.no_grad():
                 # if this is the first batch of the target domain, copy it as running mean, var
                 # else use running average calculation TODO try track number calculation
-                if self.adapt_start == False:
-                    self.running_mean = mean
-                    self.running_var = var
-                    self.adapt_start = torch.tensor(True)
-                else:
-                    self.running_mean = exponential_average_factor * mean\
-                        + (1 - exponential_average_factor) * self.running_mean
-                    self.running_var = exponential_average_factor * var * n / (n - 1)\
-                        + (1 - exponential_average_factor) * self.running_var
+            if self.adapt_start == False:
+                self.running_mean = mean
+                self.running_var = var
+                self.adapt_start = torch.tensor(True)
+            else:
+                self.running_mean = exponential_average_factor * mean\
+                    + (1 - exponential_average_factor) * self.running_mean
+                self.running_var = exponential_average_factor * var * n / (n - 1)\
+                    + (1 - exponential_average_factor) * self.running_var
             mean = self.lambda_ * self.source_mean + (1-self.lambda_) * self.running_mean
             var = self.lambda_ * self.source_var + (1-self.lambda_) * self.running_var
 
@@ -612,11 +614,11 @@ class EvalUpdateBatchNorm2d(CustomBatchNorm2d):
         else:
             exponential_average_factor = self.momentum
             mean, var = mean_cur, var_cur
-            with torch.no_grad():
-                self.running_mean = exponential_average_factor * mean\
-                    + (1 - exponential_average_factor) * self.running_mean
-                self.running_var = exponential_average_factor * var * n / (n - 1)\
-                    + (1 - exponential_average_factor) * self.running_var
+            # with torch.no_grad():
+            self.running_mean = exponential_average_factor * mean\
+                + (1 - exponential_average_factor) * self.running_mean
+            self.running_var = exponential_average_factor * var * n / (n - 1)\
+                + (1 - exponential_average_factor) * self.running_var
             # mean = self.lambda_ * self.source_mean + (1-self.lambda_) * self.running_mean
             # var = self.lambda_ * self.source_var + (1-self.lambda_) * self.running_var
             mean = self.running_mean
@@ -693,11 +695,11 @@ class SIFAEvalUpdateBatchNorm2d(EvalUpdateBatchNorm2d):
         else:
             exponential_average_factor = self.momentum
             mean, var = mean_cur, var_cur
-            with torch.no_grad():
-                self.running_mean = exponential_average_factor * mean\
-                    + (1 - exponential_average_factor) * self.running_mean
-                self.running_var = exponential_average_factor * var * n / (n - 1)\
-                    + (1 - exponential_average_factor) * self.running_var
+            # with torch.no_grad():
+            self.running_mean = exponential_average_factor * mean\
+                + (1 - exponential_average_factor) * self.running_mean
+            self.running_var = exponential_average_factor * var * n / (n - 1)\
+                + (1 - exponential_average_factor) * self.running_var
             # mean = self.lambda_ * self.source_mean + (1-self.lambda_) * self.running_mean
             # var = self.lambda_ * self.source_var + (1-self.lambda_) * self.running_var
             mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
@@ -1657,27 +1659,16 @@ class DIGA(LightningModule):
         optimizer: torch.optim.Optimizer = None,
     ):
         super().__init__()
+      
         self.save_hyperparameters(logger=False, ignore=["net"])
         self.net = net(
             num_classes=self.hparams.dataset_info["num_classes"],
             output_size=self.hparams.dataset_info["image_size"],
         )
-        
-        # Freeze all parameters first
-        for param in self.net.parameters():
-            param.requires_grad = False
-            
-        # Enable BN affine parameters
-        for m in self.net.modules():
-            if isinstance(m, SIFABatchNorm2d):
-                if m.affine:
-                    m.weight.requires_grad = True
-                    m.bias.requires_grad = True
-        
         # use separate metric instance for train, val and test step
         # to ensure a proper reduction over the epoch
         self.train_acc = SegmentationMetric(num_classes=self.hparams.dataset_info["num_classes"], ignore_index=255)
-        self.test_acc = nn.ModuleList([SegmentationMetric(num_classes=self.hparams.dataset_info["num_classes"], ignore_index=255).cpu() for _ in self.hparams.dataset_info["test_list"]])
+        self.test_acc = nn.ModuleList([SegmentationMetric(num_classes=self.hparams.dataset_info["num_classes"], ignore_index=255) for _ in self.hparams.dataset_info["test_list"]])
         
         self.test_step_global = 0
         
@@ -1686,11 +1677,13 @@ class DIGA(LightningModule):
         self.total_pixels_per_image = []
         self.image_indices = []
         
+        # Load class medians from JSON
+        self.class_medians = self._load_class_medians()
+        
         # Replace BN layers and configure them
         self._replace_bn()
         self._configure_bn_running_stats()
-        
-        # Initialize class calculation counter
+
         self.class_calculation_count = torch.zeros(self.hparams.dataset_info["num_classes"], device=self.device)
         # Initialize thresholds array
         self.calculation_thresholds = torch.tensor([10, 100, 1000, 2500, 10000], device=self.device)
@@ -1699,25 +1692,131 @@ class DIGA(LightningModule):
         if hasattr(self, 'classifier_running_proto'):
             self.classifier_running_proto.requires_grad = True
 
-    def training_step(self, batch: Any, batch_idx: int):
+    def _save_predictions(self, preds, targets, x, feature, name_, shape_, batch_idx, dataloader_idx, acc):
+        """Save predictions and related data for all images in a batch.
+        
+        Args:
+            preds: Model predictions [B, C, H, W]
+            targets: Ground truth labels [B, H, W]
+            x: Input images [B, C, H, W]
+            feature: Feature maps [B, C, H, W]
+            name_: List of image names
+            shape_: List of original image shapes
+            batch_idx: Current batch index
+            dataloader_idx: Current dataloader index
+            acc: Accuracy score
+        """
+        os.makedirs('output/predictions', exist_ok=True)
+        
+        # Cityscapes color mapping (RGB values for each class)
+        cityscapes_colors = {
+            0: [128, 64, 128],   # road
+            1: [244, 35, 232],   # sidewalk
+            2: [70, 70, 70],     # building
+            3: [102, 102, 156],  # wall
+            4: [190, 153, 153],  # fence
+            5: [153, 153, 153],  # pole
+            6: [250, 170, 30],   # traffic light
+            7: [220, 220, 0],    # traffic sign
+            8: [107, 142, 35],   # vegetation
+            9: [152, 251, 152],  # terrain
+            10: [70, 130, 180],  # sky
+            11: [220, 20, 60],   # person
+            12: [255, 0, 0],     # rider
+            13: [0, 0, 142],     # car
+            14: [0, 0, 70],      # truck
+            15: [0, 60, 100],    # bus
+            16: [0, 80, 100],    # train
+            17: [0, 0, 230],     # motorcycle
+            18: [119, 11, 32],   # bicycle
+            255: [0, 0, 0]       # ignore
+        }
+        
+        for i, img_name in enumerate(name_):
+            # Get predictions and ground truth
+            pred = preds[i].argmax(dim=0).cpu().numpy()  # [H, W]
+            gt = targets[i].cpu().numpy()  # [H, W]
+            img = x[i].cpu().numpy()  # [C, H, W]
+            
+            # Create RGB visualizations
+            h, w = pred.shape
+            pred_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+            gt_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+            
+            # Map each class to its color
+            for class_id, color in cityscapes_colors.items():
+                pred_rgb[pred == class_id] = color
+                gt_rgb[gt == class_id] = color
+            
+            # Create visualization figure
+            plt.figure(figsize=(15, 5))
+            
+            # Plot input image
+            plt.subplot(131)
+            plt.imshow(np.transpose(img, (1, 2, 0)))
+            plt.title('Input Image')
+            plt.axis('off')
+            
+            # Plot prediction
+            plt.subplot(132)
+            plt.imshow(pred_rgb)
+            plt.title('Prediction')
+            plt.axis('off')
+            
+            # Plot ground truth
+            plt.subplot(133)
+            plt.imshow(gt_rgb)
+            plt.title('Ground Truth')
+            plt.axis('off')
+            
+            # Save visualization
+            filename = img_name.replace('/', '_').replace('.', '_')
+            vis_path = f'output/predictions/{filename}_vis.png'
+            plt.savefig(vis_path, bbox_inches='tight', pad_inches=0)
+            plt.close()
+            
+            # Save raw data
+            save_dict = {
+                'predictions': preds[i].cpu(),
+                'ground_truth': targets[i].cpu(),
+                'input_image': x[i].cpu(),
+                'features': feature[i].cpu() if feature is not None else None,
+                'image_name': img_name,
+                'shape': shape_[i].cpu() if shape_ is not None else None,
+                'batch_idx': batch_idx,
+                'dataloader_idx': dataloader_idx,
+                'accuracy': acc.item()
+            }
+            
+            save_path = f'output/predictions/{filename}_pred.pt'
+            torch.save(save_dict, save_path)
+            print(f"Saved predictions and visualization for {img_name}")
+            print(f"- Raw data: {save_path}")
+            print(f"- Visualization: {vis_path}")
+
+    def test_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
         x, y, shape_, name_ = batch
-    
-        target_size = (y.shape[-2], y.shape[-1])
+        loss, preds, targets, info, feature = self.step(batch)
+        loss = torch.tensor(0.0)
         
-        # compute loss between prototype and model predict as pseudo-labels
-        _, outputs, pseudo_labels, info, feature = self.step(batch)
+        acc = self.test_acc[dataloader_idx](preds, targets)
         
-        feature, outputs = self.net(x, feat=True)
+        self.log(f"test/acc", acc, on_step=True, on_epoch=True, prog_bar=True, add_dataloader_idx=True)
+        self.test_step_global += 1
+
+        # Save predictions for all images in batch
+        self._save_predictions(
+            preds=preds,
+            targets=targets,
+            x=x,
+            feature=feature,
+            name_=name_,
+            shape_=shape_,
+            batch_idx=batch_idx,
+            dataloader_idx=dataloader_idx,
+            acc=acc
+        )
         
-        # Upsample to match target size (both height and width)
-        outputs = nn.Upsample(size=target_size, mode='bilinear', align_corners=True)(outputs)
-        
-        # print('y shape', y.shape)
-        # print('outputs shape', outputs.shape)
-        loss = F.cross_entropy(outputs, y, ignore_index=255)
-        acc = self.train_acc(outputs, y)
-        
-        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         return {"loss": loss}
 
     def collect_params(self, model):
@@ -1725,7 +1824,7 @@ class DIGA(LightningModule):
         names = []
         # collect only bn
         for nm, m in model.named_modules():
-            if isinstance(m, SIFABatchNorm2d) or isinstance(m, SIFABatchNorm2dTrainable):
+            if isinstance(m, SIFABatchNorm2d):
                 for np, p in m.named_parameters():
                     if np in ["weight", "bias", "lambda_"]:
                         params.append(p)
@@ -1773,28 +1872,24 @@ class DIGA(LightningModule):
     def step(self, batch: Any):
         x, y, shape_, name_ = batch
         target_size = y.shape[-2:]
+            
         outputs, info, feature, loss = self.forward_and_adapt((x,y))
-        
-        
         # loss_seg, pm = self.get_pseudolabelling_loss(preds_seg_it_raw, loss_name=self.hparams.cfg.loss_name)
         outputs = nn.Upsample(size=target_size, mode='bilinear')(outputs)
-        # loss = self.dot_loss(outputs)
-        return loss.cpu(), outputs.cpu(), y.cpu(), info, feature, loss
+        return loss, outputs.cpu(), y.cpu(), info, feature
 
-    def test_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
+    def training_step(self, batch: Any, batch_idx: int):
         x, y, shape_, name_ = batch
         
-        # Forward and adapt
-        loss, preds, targets, info, feature, loss = self.step(batch)
+        loss, preds, targets, info, feature = self.step(batch)
         
-        # Store features and labels for visualization
-        self.last_features = feature
-        self.last_labels = targets
+        preds = preds.to(self.train_acc.device)
+        targets = targets.to(self.train_acc.device)
+        acc = self.train_acc(preds, targets)
         
         # log test metrics
-        acc = self.test_acc[dataloader_idx](preds, targets)
-        self.log(f"test/loss", loss, on_step=True, on_epoch=True, prog_bar=False, add_dataloader_idx=True)
-        self.log(f"test/acc", acc, on_step=True, on_epoch=True, prog_bar=True, add_dataloader_idx=True)
+        self.log(f"train/loss", loss, on_step=True, on_epoch=True, prog_bar=False, add_dataloader_idx=True)
+        self.log(f"train/acc", acc, on_step=True, on_epoch=True, prog_bar=True, add_dataloader_idx=True)
         self.test_step_global += 1
         
         return {"loss": loss}
@@ -1802,8 +1897,7 @@ class DIGA(LightningModule):
     def forward_and_adapt(self, pair):
         """Forward and adapt model on batch of data."""
         x, y = pair
-        
-        # no_grad
+          
         feature, outputs = self.net(x, feat=True)
         
         to_logs = {}
@@ -1819,16 +1913,14 @@ class DIGA(LightningModule):
         # fusion_lambda)
         outputs_softmax = outputs.softmax(1)
         fused_outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs_softmax * (1 - self.hparams.cfg.fusion_lambda)
-        
-        # Calculate cross-entropy loss where:
-        # - outputs is the model prediction to be learned
-        # - fused_outputs.argmax(1) is the pseudo label from prototype
-        loss = cross_entropy_2d(outputs, fused_outputs.argmax(1))
-        
-        return fused_outputs, to_logs, feature, loss
+      
+        pseudo_labels = outputs.argmax(1)
+        # pseudo_labels = fused_outputs.argmax(1)
+        loss = F.cross_entropy(outputs, pseudo_labels, ignore_index=255)
+            
+        return fused_outputs.cpu(), to_logs, feature, loss
 
     def test_epoch_end(self, outputs: List[Any]): 
-        # Calculate and print statistics
         stats = self._calculate_overall_statistics()
         self._print_statistics(stats)
         
@@ -1900,9 +1992,9 @@ class DIGA(LightningModule):
         outputs = outputs.softmax(dim=1)
         pseudo_label = outputs.argmax(dim=1)
         
-        # Calculate number of pixels above threshold for each image in the batch
-        max_probs = outputs.max(dim=1)[0]
-    
+        # Get max probabilities for each pixel and which class has max probability for each pixel
+        max_probs, max_probs_class = outputs.max(dim=1)
+        
         # Calculate number of pixels to keep per image
         total_pixels_per_image = max_probs[0].numel()  # H * W
         k_pixels = int(total_pixels_per_image * number_of_prototypes)  # Number of pixels to keep
@@ -1924,19 +2016,30 @@ class DIGA(LightningModule):
             
             # Reshape mask back to image dimensions
             confident_mask[i] = img_mask.reshape(max_probs[i].shape)
-        
+            
+            for c in range(self.hparams.dataset_info["num_classes"]):
+                class_mask = (max_probs_class[i] == c)
+                if class_mask.sum() > 0:
+                    class_probs = max_probs[i][class_mask]
+                    confident_mask[i][class_mask] &= (class_probs > self.class_medians[c])
+                    
+                    above_median = (class_probs > self.class_medians[c]).sum().item()
+                    total_class_pixels = class_mask.sum().item()
+                    # print(f"Class {c}: {above_median}/{total_class_pixels} pixels above({self.class_medians[c]:.3f})")
+                    
         # Process confident pixels for smaller than threshold
-        confident_mask = confident_mask & (max_probs > threshold)
-    
+        # confident_mask = confident_mask & (max_probs > threshold)
+
         # Update statistics
         above_threshold = confident_mask.sum().item()
         total_pixels = confident_mask.numel()
         self._update_statistics(above_threshold, total_pixels)
         
-        # Set non-confident pixels to 255
         pseudo_label[~confident_mask] = 255
         pseudo_unique = pseudo_label.unique()
-        # print('number of confident', len(pseudo_unique))
+        # number of confident pixels / total pixels
+        not_confident_percentage = (total_pixels - above_threshold) / total_pixels * 100
+        print(f"not confident percentage: {not_confident_percentage:.2f}%")
         return pseudo_label
     
     def multi_proto_label(self, feature, outputs, y, class_names, cfg):
@@ -1956,7 +2059,7 @@ class DIGA(LightningModule):
 
         """
         multi_pred, to_logs = None, {}
-        y = F.interpolate(y.unsqueeze(1).float(), size=outputs.shape[2:], mode="nearest").squeeze(1).long()
+        # y = F.interpolate(y.unsqueeze(1).float(), size=outputs.shape[2:], mode="nearest").squeeze(1).long()
         proto_label = self.high_confident_proto_label(
             outputs, 
             threshold=cfg.confidence_threshold, 
@@ -2002,7 +2105,7 @@ class DIGA(LightningModule):
         weight = weight / torch.sum(weight, dim=1, keepdim=True) # [B, C, H, W]
         return weight
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def _update_classifier_proto(self, feature, y, classifier_proto, classifier_proto_exists_flag, rho=None):
         """Update the prototype of the classifier.
         Args:
@@ -2040,7 +2143,7 @@ class DIGA(LightningModule):
                 self.class_calculation_count[i] += 1
         return classifier_proto, classifier_proto_exists_flag 
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def proto_weight(self, proto, feature, tau=1.0):
         """ Calculate the weight for classes of each pixel.
         For each pixel, we calculate the distance between the prototype of each class and the feature of the pixel.
@@ -2100,15 +2203,38 @@ class DIGA(LightningModule):
         # use replace all batch norm module m in self.net with custom batch norm module
         for n, module in self.net.named_modules():
             if isinstance(module, nn.BatchNorm2d):
-                set_layer(self.net, n, SIFABatchNorm2dTrainable().from_bn(module).to(self.device))
+                set_layer(self.net, n, SIFABatchNorm2d().from_bn(module).to(self.device))
    
     def _configure_bn_running_stats(self):
+        for param in self.net.parameters():
+            param.requires_grad = False
+        
         for m in self.net.modules():
-            # if isinstance(m, nn.BatchNorm2d):
             if isinstance(m, SIFABatchNorm2d):
                 m.lambda_.data = torch.tensor(self.hparams.cfg.bn_lambda)
                 m.memory_bank_size = self.hparams.cfg.memory_bank_size
+                m.track_running_stats = False
+                m.weight.requires_grad = True
+                m.bias.requires_grad = True
     
+    def _load_class_medians(self):
+        """Load class medians from JSON file."""
+        try:
+            file_path = os.path.join(os.path.dirname(__file__), 'class_medians.json')
+            if os.path.exists(file_path):
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                    medians = data['class_medians']
+                print(f"Successfully loaded class medians from {file_path}")
+               
+                medians = [min(0.9, m) for m in medians]
+                return torch.tensor(medians, device=self.device)
+            else:
+                raise FileNotFoundError(f"class_medians.json not found at {file_path}")
+        except FileNotFoundError as e:
+            print(f"Warning: {str(e)}. Using default threshold.")
+            return torch.ones(self.hparams.dataset_info["num_classes"], device=self.device) * 0.9
+                
     # others
     @property
     def wandb(self):

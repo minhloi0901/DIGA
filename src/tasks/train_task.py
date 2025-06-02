@@ -2,7 +2,7 @@ from typing import List, Tuple
 
 import hydra
 import pytorch_lightning as pl
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Callback, LightningDataModule, LightningModule, Trainer
 from pytorch_lightning.loggers import LightningLoggerBase
 
@@ -37,14 +37,11 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
 
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = utils.instantiate_callbacks(cfg.get("callbacks"))
-
+    
     log.info("Instantiating loggers...")
     logger: List[LightningLoggerBase] = utils.instantiate_loggers(cfg.get("logger"))
 
-    log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
-    import torch
-    num_gpus = torch.cuda.device_count()
-    print(f"Available GPUs: {num_gpus}")
+    log.info("Instantiating loggers...")
     trainer: Trainer = hydra.utils.instantiate(cfg.trainer, callbacks=callbacks, logger=logger)
 
     object_dict = {
@@ -60,12 +57,15 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
         log.info("Logging hyperparameters!")
         utils.log_hyperparameters(object_dict)
 
+    ckpt_path = trainer.checkpoint_callback.best_model_path
+     
     if cfg.get("train"):
         log.info("Starting training!")
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
+        # trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
 
     train_metrics = trainer.callback_metrics
-
+  
     if cfg.get("test"):
         log.info("Starting testing!")
         ckpt_path = trainer.checkpoint_callback.best_model_path

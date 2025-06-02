@@ -1,0 +1,3 @@
+- experiment=ttda
+- model/net=gta5_source
+- datamodule/test_list=cityscapes

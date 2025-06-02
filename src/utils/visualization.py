@@ -29,26 +29,25 @@ def visualize_gtFine(gt_path, save_path=None):
     """
     # Cityscapes color mapping (RGB values for each class)
     cityscapes_colors = {
-        0: [0, 0, 0],        # unlabeled
-        1: [70, 70, 70],     # road
-        2: [100, 40, 40],    # sidewalk
-        3: [55, 90, 80],     # building
-        4: [220, 20, 60],    # wall
-        5: [153, 153, 153],  # fence
-        6: [157, 234, 50],   # pole
-        7: [128, 64, 128],   # traffic light
-        8: [244, 35, 232],   # traffic sign
-        9: [107, 142, 35],   # vegetation
-        10: [0, 0, 142],     # terrain
-        11: [102, 102, 156], # sky
-        12: [220, 220, 0],   # person
-        13: [70, 130, 180],  # rider
-        14: [81, 0, 81],     # car
-        15: [150, 100, 100], # truck
-        16: [230, 150, 140], # bus
-        17: [180, 165, 180], # train
-        18: [250, 170, 30],  # motorcycle
-        19: [110, 190, 160], # bicycle
+        0: [128, 64, 128],   # road
+        1: [244, 35, 232],   # sidewalk
+        2: [70, 70, 70],     # building
+        3: [102, 102, 156],  # wall
+        4: [190, 153, 153],  # fence
+        5: [153, 153, 153],  # pole
+        6: [250, 170, 30],   # traffic light
+        7: [220, 220, 0],    # traffic sign
+        8: [107, 142, 35],   # vegetation
+        9: [152, 251, 152],  # terrain
+        10: [70, 130, 180],  # sky
+        11: [220, 20, 60],   # person
+        12: [255, 0, 0],     # rider
+        13: [0, 0, 142],     # car
+        14: [0, 0, 70],      # truck
+        15: [0, 60, 100],    # bus
+        16: [0, 80, 100],    # train
+        17: [0, 0, 230],     # motorcycle
+        18: [119, 11, 32],   # bicycle
         255: [0, 0, 0]       # ignore
     }
     
@@ -88,26 +87,25 @@ def visualize_batch_gtFine(gt_batch, save_path=None):
     
     # Cityscapes color mapping (RGB values for each class)
     cityscapes_colors = {
-        0: [0, 0, 0],        # unlabeled
-        1: [70, 70, 70],     # road
-        2: [100, 40, 40],    # sidewalk
-        3: [55, 90, 80],     # building
-        4: [220, 20, 60],    # wall
-        5: [153, 153, 153],  # fence
-        6: [157, 234, 50],   # pole
-        7: [128, 64, 128],   # traffic light
-        8: [244, 35, 232],   # traffic sign
-        9: [107, 142, 35],   # vegetation
-        10: [0, 0, 142],     # terrain
-        11: [102, 102, 156], # sky
-        12: [220, 220, 0],   # person
-        13: [70, 130, 180],  # rider
-        14: [81, 0, 81],     # car
-        15: [150, 100, 100], # truck
-        16: [230, 150, 140], # bus
-        17: [180, 165, 180], # train
-        18: [250, 170, 30],  # motorcycle
-        19: [110, 190, 160], # bicycle
+        0: [128, 64, 128],   # road
+        1: [244, 35, 232],   # sidewalk
+        2: [70, 70, 70],     # building
+        3: [102, 102, 156],  # wall
+        4: [190, 153, 153],  # fence
+        5: [153, 153, 153],  # pole
+        6: [250, 170, 30],   # traffic light
+        7: [220, 220, 0],    # traffic sign
+        8: [107, 142, 35],   # vegetation
+        9: [152, 251, 152],  # terrain
+        10: [70, 130, 180],  # sky
+        11: [220, 20, 60],   # person
+        12: [255, 0, 0],     # rider
+        13: [0, 0, 142],     # car
+        14: [0, 0, 70],      # truck
+        15: [0, 60, 100],    # bus
+        16: [0, 80, 100],    # train
+        17: [0, 0, 230],     # motorcycle
+        18: [119, 11, 32],   # bicycle
         255: [0, 0, 0]       # ignore
     }
     
@@ -183,29 +181,28 @@ def visualize_image_and_gtFine(image_path, gt_path, json_path=None, save_path=No
         percentage = (pixel_count / total_pixels) * 100
         print(f"Class {class_id}: {pixel_count} pixels ({percentage:.2f}%)")
     
-    # Cityscapes color mapping (RGB values for each class) - adjusted for better visibility
+    # Cityscapes color mapping (RGB values for each class)
     cityscapes_colors = {
-        0: [0, 0, 0],        # unlabeled
-        1: [128, 64, 128],   # road (purple)
-        2: [244, 35, 232],   # sidewalk (pink)
-        3: [70, 70, 70],     # building (dark gray)
-        4: [102, 102, 156],  # wall (blue-gray)
-        5: [190, 153, 153],  # fence (light brown)
-        6: [153, 153, 153],  # pole (gray)
-        7: [250, 170, 30],   # traffic light (orange)
-        8: [220, 220, 0],    # traffic sign (yellow)
-        9: [107, 142, 35],   # vegetation (green)
-        10: [152, 251, 152], # terrain (light green)
-        11: [70, 130, 180],  # sky (blue)
-        12: [220, 20, 60],   # person (red)
-        13: [255, 0, 0],     # rider (bright red)
-        14: [0, 0, 142],     # car (dark blue)
-        15: [0, 0, 70],      # truck (darker blue)
-        16: [0, 60, 100],    # bus (navy blue)
-        17: [0, 80, 100],    # train (dark navy)
-        18: [0, 0, 230],     # motorcycle (bright blue)
-        19: [119, 11, 32],   # bicycle (burgundy)
-        255: [128, 128, 128] # out of ROI (gray)
+        0: [128, 64, 128],   # road
+        1: [244, 35, 232],   # sidewalk
+        2: [70, 70, 70],     # building
+        3: [102, 102, 156],  # wall
+        4: [190, 153, 153],  # fence
+        5: [153, 153, 153],  # pole
+        6: [250, 170, 30],   # traffic light
+        7: [220, 220, 0],    # traffic sign
+        8: [107, 142, 35],   # vegetation
+        9: [152, 251, 152],  # terrain
+        10: [70, 130, 180],  # sky
+        11: [220, 20, 60],   # person
+        12: [255, 0, 0],     # rider
+        13: [0, 0, 142],     # car
+        14: [0, 0, 70],      # truck
+        15: [0, 60, 100],    # bus
+        16: [0, 80, 100],    # train
+        17: [0, 0, 230],     # motorcycle
+        18: [119, 11, 32],   # bicycle
+        255: [0, 0, 0]       # ignore
     }
     
     # Create RGB visualization for ground truth
@@ -312,26 +309,25 @@ def visualize_batch_image_and_gtFine(image_batch, gt_batch, save_path=None):
     
     # Cityscapes color mapping (RGB values for each class)
     cityscapes_colors = {
-        0: [0, 0, 0],        # unlabeled
-        1: [70, 70, 70],     # road
-        2: [100, 40, 40],    # sidewalk
-        3: [55, 90, 80],     # building
-        4: [220, 20, 60],    # wall
-        5: [153, 153, 153],  # fence
-        6: [157, 234, 50],   # pole
-        7: [128, 64, 128],   # traffic light
-        8: [244, 35, 232],   # traffic sign
-        9: [107, 142, 35],   # vegetation
-        10: [0, 0, 142],     # terrain
-        11: [102, 102, 156], # sky
-        12: [220, 220, 0],   # person
-        13: [70, 130, 180],  # rider
-        14: [81, 0, 81],     # car
-        15: [150, 100, 100], # truck
-        16: [230, 150, 140], # bus
-        17: [180, 165, 180], # train
-        18: [250, 170, 30],  # motorcycle
-        19: [110, 190, 160], # bicycle
+        0: [128, 64, 128],   # road
+        1: [244, 35, 232],   # sidewalk
+        2: [70, 70, 70],     # building
+        3: [102, 102, 156],  # wall
+        4: [190, 153, 153],  # fence
+        5: [153, 153, 153],  # pole
+        6: [250, 170, 30],   # traffic light
+        7: [220, 220, 0],    # traffic sign
+        8: [107, 142, 35],   # vegetation
+        9: [152, 251, 152],  # terrain
+        10: [70, 130, 180],  # sky
+        11: [220, 20, 60],   # person
+        12: [255, 0, 0],     # rider
+        13: [0, 0, 142],     # car
+        14: [0, 0, 70],      # truck
+        15: [0, 60, 100],    # bus
+        16: [0, 80, 100],    # train
+        17: [0, 0, 230],     # motorcycle
+        18: [119, 11, 32],   # bicycle
         255: [0, 0, 0]       # ignore
     }
     

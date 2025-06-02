@@ -151,8 +151,8 @@ class ResNetMulti(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
-                #        for i in m.parameters():
-                #            i.requires_grad = False
+                for i in m.parameters():
+                    i.requires_grad = False
 
     def _make_layer(self, block, planes, blocks, stride=1, dilation=1):
         downsample = None
