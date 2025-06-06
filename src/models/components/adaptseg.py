@@ -101,7 +101,6 @@ class Bottleneck(nn.Module):
 
         return out
 
-
 class Classifier_Module(nn.Module):
     def __init__(self, inplanes, dilation_series, padding_series, num_classes):
         super(Classifier_Module, self).__init__()
@@ -124,7 +123,22 @@ class Classifier_Module(nn.Module):
         for i in range(len(self.conv2d_list) - 1):
             out += self.conv2d_list[i + 1](x)
             return out
-
+        
+class EdgeDetectionHead(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(64, 1, kernel_size=1)
+        
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = torch.sigmoid(x)
+        return x
 
 class ResNetMulti(nn.Module):
     def __init__(self, block, layers, num_classes):
@@ -143,7 +157,9 @@ class ResNetMulti(nn.Module):
         self.layer4 = self._make_layer(block, 512, layers[3], stride=1, dilation=4)
         self.layer5 = self._make_pred_layer(Classifier_Module, 1024, [6, 12, 18, 24], [6, 12, 18, 24], num_classes)
         self.layer6 = self._make_pred_layer(Classifier_Module, 2048, [6, 12, 18, 24], [6, 12, 18, 24], num_classes)
-
+        
+        self.edge_head = EdgeDetectionHead(256)
+        
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
@@ -174,21 +190,39 @@ class ResNetMulti(nn.Module):
     def _make_pred_layer(self, block, inplanes, dilation_series, padding_series, num_classes):
         return block(inplanes, dilation_series, padding_series, num_classes)
 
-    def forward(self, x, feat=False):
+    def forward(self, x, feat=False, edge=False):
+        image_size = x.size()
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
         x = self.maxpool(x)
         x = self.layer1(x)
+        
+        if edge:
+            low_feature = self.edge_head(x)
+            # print('low feature shape', low_feature.shape)
+            # print('x below shape', x.shape)
+            low_feature = F.interpolate(low_feature, size=image_size[2:], mode='bilinear', align_corners=True)
+            # print('low feature shape', low_feature.shape)
+            x = self.layer2(x)
+            x = self.layer3(x)
+            if feat:
+                x2 = self.layer4(x)
+                feat, x2 = self.layer6(x2, feat=feat)
+                return feat, x2, low_feature
+            x1 = self.layer5(x)
+            x2 = self.layer4(x)
+            x2 = self.layer6(x2)
+            return x1, x2, low_feature
+            
         x = self.layer2(x)
         x = self.layer3(x)
         if feat:
             x2 = self.layer4(x)
             feat, x2 = self.layer6(x2, feat=feat)
             return feat, x2
-
+    
         x1 = self.layer5(x)
-
         x2 = self.layer4(x)
         x2 = self.layer6(x2)
         return x1, x2

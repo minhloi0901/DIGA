@@ -27,6 +27,7 @@ import time
 import matplotlib.pyplot as plt
 import os 
 import json
+import cv2
 
 logger = logging.getLogger('lightning')
 logging.getLogger('PIL').setLevel(logging.INFO)
@@ -1684,13 +1685,17 @@ class DIGA(LightningModule):
         self._replace_bn()
         self._configure_bn_running_stats()
 
+        # Loss init
+        self.edge_loss = nn.BCEWithLogitsLoss()
+        
         self.class_calculation_count = torch.zeros(self.hparams.dataset_info["num_classes"], device=self.device)
         # Initialize thresholds array
         self.calculation_thresholds = torch.tensor([10, 100, 1000, 2500, 10000], device=self.device)
-        
         # Initialize prototype parameters if they exist
         if hasattr(self, 'classifier_running_proto'):
             self.classifier_running_proto.requires_grad = True
+            
+        self.saved_images_count = 0
 
     def _save_predictions(self, preds, targets, x, feature, name_, shape_, batch_idx, dataloader_idx, acc):
         """Save predictions and related data for all images in a batch.
@@ -1788,10 +1793,10 @@ class DIGA(LightningModule):
                 'accuracy': acc.item()
             }
             
-            save_path = f'output/predictions/{filename}_pred.pt'
-            torch.save(save_dict, save_path)
+            # save_path = f'output/predictions/{filename}_pred.pt'
+            # torch.save(save_dict, save_path)
             print(f"Saved predictions and visualization for {img_name}")
-            print(f"- Raw data: {save_path}")
+            # print(f"- Raw data: {save_path}")
             print(f"- Visualization: {vis_path}")
 
     def test_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
@@ -1804,18 +1809,19 @@ class DIGA(LightningModule):
         self.log(f"test/acc", acc, on_step=True, on_epoch=True, prog_bar=True, add_dataloader_idx=True)
         self.test_step_global += 1
 
-        # Save predictions for all images in batch
-        self._save_predictions(
-            preds=preds,
-            targets=targets,
-            x=x,
-            feature=feature,
-            name_=name_,
-            shape_=shape_,
-            batch_idx=batch_idx,
-            dataloader_idx=dataloader_idx,
-            acc=acc
-        )
+        if self.saved_images_count < 20:
+            self.saved_images_count += 1
+            self._save_predictions(
+                preds=preds,
+                targets=targets,
+                x=x,
+                feature=feature,
+                name_=name_,
+                shape_=shape_,
+                batch_idx=batch_idx,
+                dataloader_idx=dataloader_idx,
+                acc=acc
+            )
         
         return {"loss": loss}
 
@@ -1894,11 +1900,26 @@ class DIGA(LightningModule):
         
         return {"loss": loss}
 
+    @staticmethod
+    def canny_edge_tensor(image_tensor, low_threshold=50, high_threshold=150):
+        image_np = image_tensor.cpu().numpy()
+        batch_size = image_np.shape[0]
+        edges_list = []
+        
+        for i in range(batch_size):
+            gray = np.mean(image_np[i], axis=0).astype(np.uint8)
+            edges = cv2.Canny(gray, low_threshold, high_threshold)
+            edges_list.append(edges)
+            
+        edges = np.stack(edges_list)
+        edges = torch.tensor(edges).float() / 255.0
+        return edges.unsqueeze(1)
+
     def forward_and_adapt(self, pair):
         """Forward and adapt model on batch of data."""
         x, y = pair
           
-        feature, outputs = self.net(x, feat=True)
+        feature, outputs, low_feature = self.net(x, feat=True, edge=True)
         
         to_logs = {}
         outputs_proto, to_logs_ = self.multi_proto_label(
@@ -1914,9 +1935,16 @@ class DIGA(LightningModule):
         outputs_softmax = outputs.softmax(1)
         fused_outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs_softmax * (1 - self.hparams.cfg.fusion_lambda)
       
-        pseudo_labels = outputs.argmax(1)
-        # pseudo_labels = fused_outputs.argmax(1)
-        loss = F.cross_entropy(outputs, pseudo_labels, ignore_index=255)
+        if self.training:
+            pseudo_labels = outputs.argmax(1)
+            loss = F.cross_entropy(outputs, pseudo_labels, ignore_index=255)
+            
+            edge_canny = DIGA.canny_edge_tensor(x).to(self.device)
+            low_feature = low_feature.to(self.device)
+            edge_loss = self.edge_loss(low_feature, edge_canny)
+            loss += edge_loss * 0.5
+        else:
+            loss = torch.tensor(0.0, device=self.device)
             
         return fused_outputs.cpu(), to_logs, feature, loss
 
