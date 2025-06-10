@@ -123,7 +123,18 @@ class Classifier_Module(nn.Module):
         for i in range(len(self.conv2d_list) - 1):
             out += self.conv2d_list[i + 1](x)
             return out
-        
+
+def initialize_weights(*models):
+    for model in models:
+        for module in model.modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                nn.init.kaiming_normal_(module.weight)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+            elif isinstance(module, nn.BatchNorm2d):
+                module.weight.data.fill_(1)
+                module.bias.data.zero_()
+                     
 class EdgeDetectionHead(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
@@ -159,6 +170,7 @@ class ResNetMulti(nn.Module):
         self.layer6 = self._make_pred_layer(Classifier_Module, 2048, [6, 12, 18, 24], [6, 12, 18, 24], num_classes)
         
         self.edge_head = EdgeDetectionHead(256)
+        initialize_weights(self.edge_head)
         
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -243,6 +255,10 @@ class ResNetMulti(nn.Module):
         b.append(self.layer3)
         b.append(self.layer4)
 
+        for param in self.edge_head.parameters():
+            if param.requires_grad:
+                b.append(param)
+                
         for i in range(len(b)):
             for j in b[i].modules():
                 jj = 0

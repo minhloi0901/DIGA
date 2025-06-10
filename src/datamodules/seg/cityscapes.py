@@ -2,6 +2,7 @@ import numpy as np
 import numpy as np
 from PIL import Image
 from torch.utils import data
+import torch
 
 import json
 import uuid
@@ -57,5 +58,16 @@ class CityscapesDataSet(BaseDataset):
         label = self.get_labels(label_file)
         label = self.map_labels(label).copy()
         image = self.get_image(img_file)
+        # Convert numpy array to PIL Image for saving
+        pre_img = Image.fromarray(image.astype('uint8'))
+        pre_img.save("test.png")
         image = self.preprocess(image)
+        image_vis = torch.from_numpy(image.copy()).float()
+        # Normalize to 0-1 range for visualization
+        image_vis = (image_vis - image_vis.min()) / (image_vis.max() - image_vis.min())
+        # Convert to HWC for saving
+        image_vis = image_vis.numpy().transpose(1, 2, 0)
+        image_vis = (image_vis * 255).astype('uint8')
+        after_img = Image.fromarray(image_vis)
+        after_img.save("after.png")
         return image.copy(), label, np.array(image.shape), name

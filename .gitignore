@@ -170,3 +170,6 @@ sync_log.txt
 /mmsegmentation
 notebooks/tmp.ipynb
 /notebooks/*
+
+# output for test
+code/DIGA/outputs/*
