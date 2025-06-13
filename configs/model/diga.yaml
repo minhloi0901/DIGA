@@ -8,5 +8,20 @@ cfg:
   confidence_threshold: 0.9
   number_of_prototypes: 0.7 # best
   proto_rho: 0.4 # best
-  lambda_dot: 0.9
   memory_bank_size: 32
+  positive:
+    enabled: True
+    shot_capacity: 3
+    alpha: 1.0
+    beta: 7.0
+  negative:
+    enabled: True
+    shot_capacity: 2
+    alpha: 0.117
+    beta: 1.0
+    entropy_threshold:
+      lower: 0.2
+      upper: 0.5
+    mask_threshold:
+      lower: 0.03
+      upper: 1.0
