@@ -2102,9 +2102,9 @@ class DIGA(LightningModule):
         """Forward and adapt model on batch of data."""
         x, y, shape_, name_ = batch
 
-        # feature, outputs, low_feature = self.net(x, feat=True, edge=True)
-        with torch.no_grad():
-            feature, outputs = self.net(x, feat=True)
+        feature, outputs, low_feature = self.net(x, feat=True, edge=True)
+        # with torch.no_grad():
+        # feature, outputs = self.net(x, feat=True)
         
         to_logs = {}
         outputs_proto, to_logs_ = self.multi_proto_label(
@@ -2121,26 +2121,32 @@ class DIGA(LightningModule):
         fused_outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs_softmax * (1 - self.hparams.cfg.fusion_lambda)
 
         if self.training:
-            low_confident_regions = self.extract_and_save_regions(x, fused_outputs)
+            # low_confident_regions = self.extract_and_save_regions(x, fused_outputs)
             
-            new_x, check = self.add_confident_region(x, low_confident_regions)
+            # new_x, check = self.add_confident_region(x, low_confident_regions)
             
             # if check:  
             #     self.visualize_image(new_x[0], "/root/duc-loi/code/DIGA/output/new_x", name_[0])
                 
-            _, new_outputs = self.net(new_x, feat=True)
+            # _, new_outputs = self.net(new_x, feat=True)
             
-            # pseudo_labels = outputs.argmax(1)
-            # loss = self.loss(outputs, pseudo_labels)
-            pseudo_labels_new = new_outputs.argmax(1)
-            loss = self.loss(new_outputs, pseudo_labels_new)
+            pseudo_labels = outputs.argmax(1)
+            # soft_pls = outputs.softmax(1)
+            # soft_pls_sharpened = soft_pls ** 2
+            # soft_pls_sharpened = soft_pls_sharpened / soft_pls_sharpened.sum(dim=1, keepdim=True)
+            # eps = 1e-8
+            # soft_pls_sharpened = soft_pls_sharpened * (1 - eps) + eps / soft_pls_sharpened.size(1)
+       
+            # loss = F.cross_entropy(outputs, soft_pls_sharpened)
+            # pseudo_labels_new = new_outputs.argmax(1)
+            # loss = self.loss(new_outputs, pseudo_labels_new)
             
-            # edge_canny = DIGA.canny_edge_tensor(x).to(self.device)
-            # low_feature = low_feature.to(self.device)
-            # edge_loss = self.edge_loss(low_feature, edge_canny)
+            edge_canny = DIGA.canny_edge_tensor(x).to(self.device)
+            low_feature = low_feature.to(self.device)
+            edge_loss = self.edge_loss(low_feature, edge_canny)
             # print('loss: ', loss)
             # print('edge loss: ', edge_loss)
-            # loss += edge_loss * 0.1
+            loss = 0.7 * self.loss(outputs, pseudo_labels) + edge_loss * 0.3
             
             # if self.saved_edges_count < 20:
                 # self.saved_edges_count += 1
