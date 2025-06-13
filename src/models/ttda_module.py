@@ -25,6 +25,7 @@ import random
 from tqdm import tqdm
 import time 
 import matplotlib.pyplot as plt
+import operator
 
 logger = logging.getLogger('lightning')
 logging.getLogger('PIL').setLevel(logging.INFO)
@@ -718,6 +719,11 @@ def softmax_entropy(x: torch.Tensor) -> torch.Tensor:
     x = -(x.softmax(1) * x.log_softmax(1)).sum(1)
     x = x.flatten(1).mean(1)
     return x
+
+def get_entropy(loss, class_size):
+    import math
+    max_entropy = math.log2(class_size)
+    return loss / max_entropy
 
 def cross_entropy_2d(predict, target):
     """
@@ -1693,8 +1699,6 @@ class DIGA(LightningModule):
         # DOT settings
         self.num_classes = self.hparams.dataset_info['num_classes']
         self.z_t = torch.ones(self.num_classes) / self.num_classes
-        # print(f'[DIGA DEBUG] num_classes: {self.num_classes}')
-        self.lambda_dot = cfg.lambda_dot
         
         self.save_hyperparameters(logger=False, ignore=["net"])
         self._replace_bn()
@@ -1708,6 +1712,13 @@ class DIGA(LightningModule):
         self.class_calculation_count = torch.zeros(self.num_classes, device=self.device)
         # Initialize thresholds array
         self.calculation_thresholds = torch.tensor([10, 100, 1000, 2500, 10000], device=self.device)
+        
+        if self.hparams.cfg.positive.enabled:
+            self.pos = self.hparams.cfg.positive
+            self.pos.cache = {}
+        if self.hparams.cfg.negative.enabled:
+            self.neg = self.hparams.cfg.negative
+            self.neg.cache = {}
     
     # lightning callback
     def on_test_start(self):
@@ -1720,48 +1731,6 @@ class DIGA(LightningModule):
         if isinstance(outputs, tuple):
             outputs = outputs[-1]
         return outputs
-    
-    # DOT
-    def dot_loss(self, outputs):
-        """
-        Compute the DOT (Dynamic Online reweightTing) loss for a batch.
-        Args:
-            outputs: (B, C, H, W) logits
-        Returns:
-            loss: scalar tensor
-        """
-        logits_flat = outputs.mean(dim=(2, 3))
-
-        probs = torch.softmax(logits_flat, dim=1)
-        pred_classes = probs.argmax(dim=1)
-        B = probs.shape[0]
-        # entropy for each sample
-        logp = torch.log(probs + 1e-8)
-        entropys = -(probs * logp).sum(dim=1)
-        
-        # DOT weights
-        class_weight = 1. / (self.z_t + 1e-8)
-        class_weight = class_weight / class_weight.sum()
-        sample_weight = class_weight[pred_classes]
-        sample_weight = sample_weight / sample_weight.sum() * B
-        
-        ent_weight = torch.ones_like(sample_weight)
-
-        total_weight = sample_weight * ent_weight
-        use_idx = torch.ones_like(total_weight, dtype=torch.bool)
-        loss = (entropys * total_weight)[use_idx].mean()
-        print(f"[DIGA DEBUG] loss: {loss}")
-        # print("logits_flat", logits_flat)
-        # print("probs", probs)
-        # print("pred_classes", pred_classes)
-        # print("self.z_t", self.z_t)
-        # print("class_weight", class_weight)
-        # print("sample_weight", sample_weight)
-        # Update z_t
-        with torch.no_grad():
-            p_mean = probs.mean(dim=0)
-            self.z_t = self.lambda_dot * self.z_t + (1 - self.lambda_dot) * p_mean
-        return loss
 
     def step(self, batch: Any):
         x, y, shape_, name_ = batch
@@ -1787,6 +1756,42 @@ class DIGA(LightningModule):
         self.test_step_global += 1
         return {"loss": loss}
     
+    def update_cache(cache, pred, features_loss, shot_cap, include_prob_map=False):
+        with torch.no_grad():
+            item = features_loss if not include_prob_map else features_loss[:2] + [features_loss[2]]
+            if pred in cache:
+                if len(cache[pred]) < shot_cap:
+                    cache[pred].append(item)
+                elif features_loss[1] < cache[pred][-1][1]:
+                    cache[pred][-1] = item
+                cache[pred] = sorted(cache[pred], key=operator.itemgetter(1))
+            else:
+                cache[pred] = [item]
+                
+    def compute_cache_logits(feature, cache, alpha, beta, class_size, neg_mask_thresholds=None):
+        with torch.no_grad():
+            cache_keys = []
+            cache_values = []
+            for class_index in sorted(cache.keys()):
+                for item in cache[class_index]:
+                    cache_keys.append(item[0])
+                    if neg_mask_thresholds:
+                        cache_values.append(item[2])
+                    else:
+                        cache_values.append(class_index)
+
+            cache_keys = torch.cat(cache_keys, dim=0).permute(1, 0)
+            if neg_mask_thresholds:
+                cache_values = torch.cat(cache_values, dim=0)
+                cache_values = (((cache_values > neg_mask_thresholds[0]) & (cache_values < neg_mask_thresholds[1])).type(torch.int8)).cuda().half()
+            else:
+                cache_values = (F.one_hot(torch.Tensor(cache_values).to(torch.int64), num_classes=class_size)).cuda().half()
+            
+            affinity = feature @ cache_keys
+            cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
+            
+            return alpha * cache_logits
+        
     def forward_and_adapt(self, pair):
         """Forward and adapt model on batch of data.
         Measure entropy of the model prediction, take gradients, and update params.
@@ -1799,6 +1804,7 @@ class DIGA(LightningModule):
         x, y = pair
         # no_grad
         feature, outputs = self.net(x, feat=True)
+        
         to_logs = {}
         outputs_proto, to_logs_ = self.multi_proto_label(
             feature,
@@ -1809,6 +1815,25 @@ class DIGA(LightningModule):
         )
 
         outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs.softmax(1) * (1 - self.hparams.cfg.fusion_lambda)
+        
+        # loss = softmax_entropy(outputs)
+        # prob_entropy = get_entropy(loss, self.num_classes)
+        # prob_map = outputs.softmax(1)
+        # print('loss shape:', loss.shape)
+        # print('prob map', prob_map.shape)
+        # pred = int(outputs.mean(0).unsqueeze(0).topk(1, 1, True, True)[1].t())
+        # print('pred shape:' , pred.shape)
+        
+        # if self.pos.enabled:
+        #     self.update_cache(self.pos.cache, pred, [feature, loss], self.pos.shot_cap)    
+        # if self.neg.enabled and self.neg.entropy_lower_threshold < prob_entropy < self.neg.entropy_upper_threshold:
+        #     self.update_cache(self.neg.cache, pred, [feature, loss, prob_map], self.neg.shot_cap, True)
+            
+        # if self.pos.enabled:
+        #     outputs += self.compute_cache_logits(feature, self.pos.cache, self.pos.alpha, self.pos.beta)   
+        # if self.neg.enabled:
+        #     outputs -= self.compute_cache_logits(feature, self.neg.cache, self.neg.alpha, self.neg.beta, [self.neg.mask_lower_threshold, self.neg.mask_upper_threshold])
+            
         return outputs.cpu(), to_logs, feature
 
     def test_epoch_end(self, outputs: List[Any]):
@@ -1974,6 +1999,44 @@ class DIGA(LightningModule):
         
         return pseudo_label
     
+    # only positive
+    # def multi_proto_label(self, feature, outputs, y, class_names, cfg):
+    #     """ Calculate label for each pixel based on multiple prototypes of each class
+    #     Args:
+    #         feature: (B, CH, H, W), feature map
+    #         outputs: (B, C, H, W), logits
+    #         y: (B, H, W), ground truth
+    #         class_names: list of class names
+    #         cfg: dict, config for multi_proto_label
+    #             strategy: str. values can be "mean_and_instance", "two_proto_per_class", ...
+    #             reduce_method: str. values can be "best", "weighted_sum", ...
+    #             lambda_: float. weight for mean prototypes in "weighted_sum" reduce_method
+    #             rho: float. weight for instance prototypes when update mean prototypes
+    #     Returns:
+    #         prediction: (B, H, W), prediction for each pixel
+
+    #     """
+    #     multi_pred, to_logs = None, {}
+    #     y = F.interpolate(y.unsqueeze(1).float(), size=outputs.shape[2:], mode="nearest").squeeze(1).long()
+    #     proto_label = self.high_confident_proto_label(
+    #         outputs, 
+    #         threshold=cfg.confidence_threshold, 
+    #         number_of_prototypes=cfg.number_of_prototypes
+    #     )
+    #     proto, exists_flag = self.cal_proto(feature, proto_label)
+        
+    #     # init or update mean prototypes
+    #     if not hasattr(self, "classifier_running_proto"):
+    #         self.classifier_running_proto, self.classifier_running_proto_exists_flag = proto, exists_flag
+    #     else:
+    #         self.classifier_running_proto, self.classifier_running_proto_exists_flag = self._update_classifier_proto(proto, exists_flag, self.classifier_running_proto, self.classifier_running_proto_exists_flag, cfg.proto_rho)
+    #     # make prediction
+    #     instance_pred = self.cal_pred_of_proto(feature, proto, exists_flag) 
+    #     mean_pred = self.cal_pred_of_proto(feature, self.classifier_running_proto, self.classifier_running_proto_exists_flag)
+    #     multi_pred = cfg.proto_lambda * mean_pred + (1-cfg.proto_lambda) * instance_pred
+    #     return multi_pred, to_logs
+    
+    # negative + positive
     def multi_proto_label(self, feature, outputs, y, class_names, cfg):
         """ Calculate label for each pixel based on multiple prototypes of each class
         Args:
@@ -1997,17 +2060,40 @@ class DIGA(LightningModule):
             threshold=cfg.confidence_threshold, 
             number_of_prototypes=cfg.number_of_prototypes
         )
-        proto, exists_flag = self.cal_proto(feature, proto_label)
+        # proto, exists_flag = self.cal_proto(feature, proto_label)
+        proto_pos, proto_neg, with_flag_pos, with_flag_neg = self.cal_proto_with_negative(feature, proto_label)
         # init or update mean prototypes
-        if not hasattr(self, "classifier_running_proto"):
-            self.classifier_running_proto, self.classifier_running_proto_exists_flag = proto, exists_flag
+        if not hasattr(self, "classifier_running_proto_pos"):
+            self.classifier_running_proto_pos, self.classifier_running_proto_pos_exists_flag = proto_pos, with_flag_pos
         else:
-            self.classifier_running_proto, self.classifier_running_proto_exists_flag = self._update_classifier_proto(feature, proto_label, self.classifier_running_proto, self.classifier_running_proto_exists_flag, cfg.proto_rho)
-        # make prediction
-        instance_pred = self.cal_pred_of_proto(feature, proto, exists_flag)
-        mean_pred = self.cal_pred_of_proto(feature, self.classifier_running_proto, self.classifier_running_proto_exists_flag)
+            self.classifier_running_proto_pos, self.classifier_running_proto_pos_exists_flag = self._update_classifier_proto(proto_pos, with_flag_pos, self.classifier_running_proto_pos, self.classifier_running_proto_pos_exists_flag, cfg.proto_rho)
+        if not hasattr(self, "classifier_running_proto_neg"):
+            self.classifier_running_proto_neg, self.classifier_running_proto_neg_exists_flag = proto_neg, with_flag_neg
+        else:
+            self.classifier_running_proto_neg, self.classifier_running_proto_neg_exists_flag = self._update_classifier_proto(proto_neg, with_flag_neg, self.classifier_running_proto_neg, self.classifier_running_proto_neg_exists_flag, cfg.proto_rho)
+            
+        instance_pred = self.cal_pred_of_proto_with_negative(feature, proto_pos, proto_neg, with_flag_pos, with_flag_neg)
+        mean_pred = self.cal_pred_of_proto_with_negative(feature, self.classifier_running_proto_pos, self.classifier_running_proto_neg, self.classifier_running_proto_pos_exists_flag, self.classifier_running_proto_neg_exists_flag)
+        
         multi_pred = cfg.proto_lambda * mean_pred + (1-cfg.proto_lambda) * instance_pred
         return multi_pred, to_logs
+    
+    def cal_pred_of_proto_with_negative(self, feature, proto_pos, proto_neg, with_flag_pos, with_flag_neg, tau=2.0, alpha_pos=1.0, alpha_neg=0.117):
+        f = feature.unsqueeze(1) 
+        
+        p_pos = proto_pos.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)  
+        dist_pos = torch.norm(f - p_pos, dim=2) 
+        weight_pos = torch.exp(-dist_pos / tau) * with_flag_pos.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+        
+        p_neg = proto_neg.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+        dist_neg = torch.norm(f - p_neg, dim=2)
+        weight_neg = torch.exp(-dist_neg / tau) * with_flag_neg.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+        
+        weight_pos = weight_pos / (weight_pos.sum(dim=1, keepdim=True) + 1e-8)
+        weight_neg = weight_neg / (weight_neg.sum(dim=1, keepdim=True) + 1e-8)
+        
+        weight = alpha_pos * weight_pos - alpha_neg * weight_neg
+        return weight  
     
     def cal_pred_of_proto(self, feature, proto, exists_flag, tau=2.0):
         """ Calculate the weight for classes of each pixel.
@@ -2026,19 +2112,16 @@ class DIGA(LightningModule):
         # calculate distance
         feature = feature.unsqueeze(1) # [B, 1, CH, H, W]
         proto = proto.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) # [1, C, CH, 1, 1]
-        # feature_norm = feature / (feature.norm(dim=2, keepdim=True) + 1e-8)
-        # proto_norm = proto / (proto.norm(dim=2, keepdim=True) + 1e-8)
-        # cos_sim = torch.sum(feature_norm * proto_norm, dim=2)
-        # dist = 1 - cos_sim
+
         dist = torch.norm(proto - feature, dim=2) # [B, C, H, W]
         # calculate weight by softmax
         weight = torch.exp(-dist / tau) # [B, C, H, W]
         weight = weight * exists_flag.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) # [B, C, H, W]
         weight = weight / torch.sum(weight, dim=1, keepdim=True) # [B, C, H, W]
         return weight
-
+        
     @torch.no_grad()
-    def _update_classifier_proto(self, feature, y, classifier_proto, classifier_proto_exists_flag, rho=None):
+    def _update_classifier_proto(self, proto, with_flag, classifier_proto, classifier_proto_exists_flag, rho=None):
         """Update the prototype of the classifier.
         Args:
             feature: [B, CH, H, W]
@@ -2048,16 +2131,7 @@ class DIGA(LightningModule):
         """
         # clone classifier proto and exists flag
         classifier_proto, classifier_proto_exists_flag = classifier_proto.clone(), classifier_proto_exists_flag.clone()
-        # calculate mean of each class
-        """ Update prototype for each class
-        At first, we need to calculate the mean of each class and numbers of pixels of each class.
-        Then, we can update the prototype of each class by total ratio.
-        Args:
-            feature: [B, C, H, W]
-            y: [B, H, W]
-        """
-        # calculate mean of each class
-        proto, with_flag = self.cal_proto(feature, y)
+    
         # update (set for the first time, update for the rest) 
         for i in range(self.hparams.dataset_info["num_classes"]):
             if not with_flag[i] or rho == 0: continue
@@ -2065,30 +2139,8 @@ class DIGA(LightningModule):
                 classifier_proto[i] = proto[i]
                 classifier_proto_exists_flag[i] = 1
             else:
-                # Adjust rho based on calculation count
-                count = self.class_calculation_count[i]
-                # Find the position in thresholds array
-                pos = torch.sum(count > self.calculation_thresholds)
-                adjusted_rho = 0.5 - (pos * 0.1)  # Start from 0.5 and decrease by 0.1 for each threshold
-                adjusted_rho = max(adjusted_rho, 0.1)  # Ensure minimum rho is 0.1
-                classifier_proto[i] = (1-adjusted_rho) * classifier_proto[i] + adjusted_rho * proto[i]
-                self.class_calculation_count[i] += 1
+                classifier_proto[i] = (1-rho) * classifier_proto[i] + rho * proto[i]
         return classifier_proto, classifier_proto_exists_flag 
-
-    def fidelity(self, feature, proto):
-        """ Calculate the fidelity of the feature and the prototype.
-        Args:
-            feature: [B, CH, H, W]
-            proto: [C, CH]
-        Returns:
-            fidelity: [B, C, H, W]
-        """
-        feature_norm = feature / np.linalg.norm(feature, axis=1, keepdims=True)
-        proto_norm = proto / np.linalg.norm(proto, axis=1, keepdims=True)
-        
-        # Compute the fidelity
-        fidelity = (feature_norm @ proto_norm) ** 2
-        return fidelity
 
     @torch.no_grad()
     def proto_weight(self, proto, feature, tau=1.0):
@@ -2123,6 +2175,7 @@ class DIGA(LightningModule):
         """
         proto = torch.zeros(self.hparams.dataset_info["num_classes"], feature.shape[1]).to(self.device)
         with_flag = torch.zeros(self.hparams.dataset_info["num_classes"]).to(self.device)
+        y_flat = y.reshape(-1)
         for i in range(self.hparams.dataset_info["num_classes"]):
             masks = (y == i).flatten()
             if masks.sum() == 0:
@@ -2131,6 +2184,28 @@ class DIGA(LightningModule):
             proto[i] = feature.permute((1, 0, 2, 3)).flatten(1).permute((1,0))[masks].mean(0)
         return proto, with_flag
     
+    def cal_proto_with_negative(self, feature, y):
+        num_classes = self.hparams.dataset_info["num_classes"]
+        C_feat = feature.shape[1]
+        proto_pos = torch.zeros(num_classes, C_feat).to(self.device)
+        proto_neg = torch.zeros(num_classes, C_feat).to(self.device)
+        with_flag_pos = torch.zeros(num_classes).to(self.device)
+        with_flag_neg = torch.zeros(num_classes).to(self.device)
+
+        feature_flat = feature.permute(0, 2, 3, 1).reshape(-1, C_feat)
+        y_flat = y.reshape(-1)
+        for i in range(num_classes):
+            pos_mask = (y_flat == i)
+            neg_mask = (y_flat != i) & (y_flat != 255)
+
+            if pos_mask.sum() > 0:
+                with_flag_pos[i] = 1
+                proto_pos[i] = feature_flat[pos_mask].mean(dim=0)
+            if neg_mask.sum() > 0:
+                with_flag_neg[i] = 1
+                proto_neg[i] = feature_flat[neg_mask].mean(dim=0)
+
+        return proto_pos, proto_neg, with_flag_pos, with_flag_neg
     # utils operation
     def _configure_bn_running_stats(self):
         """Configure model for use with eata."""
