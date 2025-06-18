@@ -29,6 +29,7 @@ import os
 import json
 import cv2
 from PIL import Image
+from .aug import AugCO
 
 logger = logging.getLogger('lightning')
 logging.getLogger('PIL').setLevel(logging.INFO)
@@ -404,13 +405,13 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
 
         exponential_average_factor = 0.0
 
-        if self.training and self.track_running_stats:
-            if self.num_batches_tracked is not None:
-                # self.num_batches_tracked.add_(1) # ! removed at Sept. 2022
-                if self.momentum is None:  # use cumulative moving average
-                    exponential_average_factor = 1.0 / float(self.num_batches_tracked)
-                else:  # use exponential moving average
-                    exponential_average_factor = self.momentum
+        # if self.training and self.track_running_stats:
+        #     if self.num_batches_tracked is not None:
+        #         # self.num_batches_tracked.add_(1) # ! removed at Sept. 2022
+        #         if self.momentum is None:  # use cumulative moving average
+        #             exponential_average_factor = 1.0 / float(self.num_batches_tracked)
+        #         else:  # use exponential moving average
+        #             exponential_average_factor = self.momentum
 
         # if batch_size > 1:
         #     half_first = True
@@ -435,13 +436,13 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
         
         # calculate running estimates
         n = input.numel() / input.size(1)
-        if self.training:
-            mean, var = mean_cur, var_cur
-            with torch.no_grad():
-                self.running_mean = exponential_average_factor * mean\
-                    + (1 - exponential_average_factor) * self.running_mean
-                self.running_var = exponential_average_factor * var * n / (n - 1)\
-                    + (1 - exponential_average_factor) * self.running_var
+        # if self.training:
+        #     mean, var = mean_cur, var_cur
+        #     with torch.no_grad():
+        #         self.running_mean = exponential_average_factor * mean\
+        #             + (1 - exponential_average_factor) * self.running_mean
+        #         self.running_var = exponential_average_factor * var * n / (n - 1)\
+        #             + (1 - exponential_average_factor) * self.running_var
         mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
         var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
         # normal train -> update running mean, var. use current mean, var
@@ -966,11 +967,11 @@ class ResNetMulti(nn.Module):
             x1 = self.layer5(x)  # produce segmap 1
         else:
             x1 = None # TODO multi level?
-        x2 = self.layer4(x)
-        x2 = self.layer6(x2)  # produce segmap 2
-        inter = nn.Upsample(size=tuple(self.output_size), mode='bilinear',
-                                align_corners=True)
-        x1, x2 = inter(x1), inter(x2)			
+            x2 = self.layer4(x)
+            x2 = self.layer6(x2)  # produce segmap 2
+            inter = nn.Upsample(size=tuple(self.output_size), mode='bilinear',
+                                    align_corners=True)
+            x1, x2 = inter(x1), inter(x2)			
         return x1, x2 # TODO check use x2
 
     def get_1x_lr_params_no_scale(self):
@@ -1712,11 +1713,17 @@ class DIGA(LightningModule):
         self.selected_class = [4, 5, 6, 7, 9, 12, 14, 15, 17, 18]
         self.register_buffer('best_region_prob', torch.zeros(num_classes, device='cpu'))
         self.register_buffer('best_region_image', torch.zeros(num_classes, 3, self.kernel_size, self.kernel_size, device='cpu'))
+        
+        self.aug = AugCO(model=self.net, num_classes=num_classes)
+        self.register_buffer('running_q', torch.zeros(num_classes))
+        self.q_momentum = 0.9
+        self.lie_alpha = 0.1
+        self.eta = 0.5
     
     def _save_edge_comparison(self, edge_canny, low_feature, name):
         """Save comparison of edge detection and low-level features.
         
-        Args:
+    Args:
             edge_canny (torch.Tensor): Canny edge detection output
             low_feature (torch.Tensor): Low-level features from the network
             name (str): Name to use for saving the image
@@ -1761,14 +1768,13 @@ class DIGA(LightningModule):
         plt.savefig(save_path)
         plt.close()
 
-    def _save_predictions(self, preds, targets, x, feature, name_, shape_, batch_idx, dataloader_idx, acc):
+    def _save_predictions(self, preds, targets, x, name_, shape_, batch_idx, dataloader_idx, acc):
         """Save predictions and related data for all images in a batch.
         
         Args:
             preds: Model predictions [B, C, H, W]
             targets: Ground truth labels [B, H, W]
             x: Input images [B, C, H, W]
-            feature: Feature maps [B, C, H, W]
             name_: List of image names
             shape_: List of original image shapes
             batch_idx: Current batch index
@@ -1852,7 +1858,6 @@ class DIGA(LightningModule):
                 'predictions': preds[i].cpu(),
                 'ground_truth': targets[i].cpu(),
                 'input_image': x[i].cpu(),
-                'features': feature[i].cpu() if feature is not None else None,
                 'image_name': img_name,
                 'shape': shape_[i].cpu() if shape_ is not None else None,
                 'batch_idx': batch_idx,
@@ -1868,9 +1873,8 @@ class DIGA(LightningModule):
 
     def test_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
         x, y, shape_, name_ = batch
-        loss, preds, targets, info, feature = self.step(batch)
+        loss, preds, targets, info = self.step(batch)
         loss = torch.tensor(0.0)
-
 
         acc = self.test_acc[dataloader_idx](preds.to(self.device), targets.to(self.device))
         
@@ -1884,7 +1888,6 @@ class DIGA(LightningModule):
                 preds=preds,
                 targets=targets,
                 x=x,
-                feature=feature,
                 name_=name_,
                 shape_=shape_,
                 batch_idx=batch_idx,
@@ -1930,33 +1933,20 @@ class DIGA(LightningModule):
         if isinstance(outputs, tuple):
             outputs = outputs[-1]
         return outputs
-    
-    def get_pseudolabeling_loss(self, mask_pred_tensor_raw, loss_name='iou'):
-        gt_mask_ce = mask_pred_tensor_raw.detach().argmax(dim=1, keepdim=True)
-        
-        gt_mask_iou = torch.zeros_like(mask_pred_tensor_raw)
-        gt_mask_iou.scatter_(1, gt_mask_ce, 1)
-        
-        if loss_name == 'iou':
-            loss = iou_loss(mask_pred_tensor_raw, gt_mask_iou, apply_softmax=True, reduction='none')
-        elif loss_name == 'ce':
-            loss = torch.nn.functional.cross_entropy(mask_pred_tensor_raw, gt_mask_ce.squeeze(1), reduction='none')
-            loss = loss.mean(dim=(1, 2))        
-        return loss, gt_mask_ce.detach().cpu()
             
     def step(self, batch: Any):
         x, y, shape_, name_ = batch
         target_size = y.shape[-2:]
             
-        outputs, info, feature, loss = self.forward_and_adapt(batch)
+        outputs, info, loss = self.forward_and_adapt(batch)
         
         outputs = nn.Upsample(size=target_size, mode='bilinear')(outputs)
-        return loss, outputs.cpu(), y.cpu(), info, feature
+        return loss, outputs.cpu(), y.cpu(), info
 
     def training_step(self, batch: Any, batch_idx: int):
         x, y, shape_, name_ = batch
         
-        loss, preds, targets, info, feature = self.step(batch)
+        loss, preds, targets, info = self.step(batch)
         
         preds = preds.to(self.train_acc.device)
         targets = targets.to(self.train_acc.device)
@@ -1968,120 +1958,11 @@ class DIGA(LightningModule):
         self.test_step_global += 1
         
         return {"loss": loss}
-
-    @staticmethod
-    def canny_edge_tensor(image_tensor, low_threshold=50, high_threshold=150):
-        image_np = image_tensor.cpu().numpy()
-        batch_size = image_np.shape[0]
-        edges_list = []
-        
-        for i in range(batch_size):
-            gray = np.mean(image_np[i], axis=0).astype(np.uint8)
-            edges = cv2.Canny(gray, low_threshold, high_threshold)
-            edges_list.append(edges)
-            
-        edges = np.stack(edges_list)
-        edges = torch.tensor(edges).float() / 255.0
-        return edges.unsqueeze(1)
-    
-    def extract_and_save_regions(self, x, fused_outputs, threshold=0.2, stride=10, low_threshold=0.1):
-        B, C, H_img, W_img = x.shape
-        B2, C2, H_out, W_out = fused_outputs.shape  
-        assert B == 1 and B2 == 1
-        
-        kernel_size_img = self.kernel_size
-        scale_h = H_img / H_out
-        scale_w = W_img / W_out
-        kernel_size_out_h = int(kernel_size_img / scale_h)
-        kernel_size_out_w = int(kernel_size_img / scale_w)
-        pad_h = kernel_size_out_h // 2
-        pad_w = kernel_size_out_w // 2
-        pad = kernel_size_img // 2
-        
-        prob_map = fused_outputs.softmax(dim=1)[0]
-        max_classes = prob_map.argmax(dim=0)
-        
-        # prob_map_pad = F.pad(prob_map, (pad_w, pad_w, pad_h, pad_h), mode='constant', value=0)
-        max_classes_pad = F.pad(max_classes.unsqueeze(0), (pad_w, pad_w, pad_h, pad_h), mode='constant', value=-1).squeeze(0)
-        x_pad = F.pad(x, (pad, pad, pad, pad), mode='reflect')
-        
-        for c in self.selected_class:
-            best_count = 0
-            best_kernel_pos = None
-            for i in range(0, H_out, stride):
-                for j in range(0, W_out, stride):
-                    # region = prob_map_pad[c, i:i + kernel_size_out_h, j:j + kernel_size_out_w]
-                    # count = (region > threshold).sum().item()
-                    region_classes = max_classes_pad[i:i + kernel_size_out_h, j:j + kernel_size_out_w]
-                    count = (region_classes == c).sum().item()
-                    if count > best_count:
-                        best_count = count
-                        best_kernel_pos = (i, j)
-            
-            if self.best_region_prob[c] < best_count:     
-                self.best_region_prob[c] = best_count
-                
-                i, j = best_kernel_pos
-                top = int(i * scale_h)
-                left = int(j * scale_w)
-                bottom = top + kernel_size_img
-                right = left + kernel_size_img
-                
-                patch_img = x_pad[0, :, top:bottom, left:right].clone()
-                self.best_region_image[c] = patch_img
-            # print(f'class {c}:', self.best_region_prob[c])
-            
-        low_confident_regions = []
-        max_probs, _ = prob_map.max(dim=0)
-        for i in range(0, H_out, stride):
-            for j in range(0, W_out, stride):
-                region_probs = max_probs[i:i + kernel_size_out_h, j:j + kernel_size_out_w]
-                mean_prob = region_probs.mean().item()
-                
-                if mean_prob < low_threshold:
-                    pos_h = int(i * scale_h)
-                    pos_w = int(j * scale_w)
-                    low_confident_regions.append((pos_h, pos_w))
-        
-        return low_confident_regions        
-    
-    def add_confident_region(self, x, low_confident_regions):
-        B, C, H, W = x.shape
-        assert B == 1
-        
-        new_x = x.clone()
-         
-        valid_classes = [c for c in self.selected_class if self.best_region_prob[c] > 0]
-        if not valid_classes or not low_confident_regions:
-            return new_x
-        
-        check = 0
-        
-        kernel_size = self.kernel_size
-        replaced_mask = torch.zeros((H, W), dtype=torch.bool, device=x.device)
-       
-        for (top, left) in low_confident_regions:
-            bottom = top + kernel_size
-            right = left + kernel_size
-            
-            if bottom > H or right > W:
-                continue
-            if replaced_mask[top:bottom, left:right].any():
-                continue
-        
-            selected_c = random.choice(valid_classes)
-            patch = self.best_region_image[selected_c].to(x.device)
-            
-            new_x[0, :, top:bottom, left:right] = patch
-        
-            check = 1
-            replaced_mask[top:bottom, left:right] = True
-
-        return new_x, check
         
     def visualize_image(self, image: torch.Tensor, folder_to_save: str, name: str):
-        os.makedirs(folder_to_save, exist_ok=True)
-
+        save_path = os.path.join(folder_to_save, name)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
         mean = torch.tensor([128.0, 128.0, 128.0]).view(3, 1, 1).to(image.device)
         image = image + mean
         image = image[[2, 1, 0], :, :]
@@ -2094,71 +1975,106 @@ class DIGA(LightningModule):
         plt.axis('off')
         plt.title(name)
 
-        save_path = os.path.join(folder_to_save, name)
         plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
         plt.close()
+    
+    def visualize_tensor(self, tensor, folder_to_save, name):
+        save_path = os.path.join(folder_to_save, name)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+        arr = tensor.detach().cpu().numpy()
+        cmap = 'jet'        
+        if arr.ndim == 3:
+            arr = np.argmax(arr, axis=0)
+
+        plt.figure()
+        plt.axis('off')
+        plt.imshow(arr, cmap=cmap)
+        plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+        plt.close()
+    
+    def update_running_q(self, probs):
+        batch_q = probs.mean(dim=[0, 2, 3])
+        self.running_q = self.q_momentum * self.running_q + (1 - self.q_momentum) * batch_q
         
+    def compute_loss_weights(self):
+        q = self.running_q + 1e-8 # avoid / 0
+        q_eta = q.pow(self.eta)
+        q_sum = q_eta.sum()
+        lambda_c = torch.log(q_sum / q_eta)
+        return lambda_c
+    
+    def loss_SST(self, outputs, pseudo_labels, mask):
+        B, C, H, W = outputs.shape
+        
+        # mask confidence
+        mask_int = mask.int()
+        
+        # update running_q
+        probs = outputs.detach().softmax(dim=1)
+        self.update_running_q(probs)
+        
+        # weight per pixel
+        lambda_c = self.compute_loss_weights()
+        weights = lambda_c[pseudo_labels]
+        
+        # compute loss cross-entropy
+        log_probs = F.log_softmax(outputs, dim=1)
+        loss_CE = -log_probs.gather(1, pseudo_labels.unsqueeze(1)).squeeze(1)
+        
+        weighted_loss = loss_CE * mask_int * weights
+        loss = weighted_loss.sum() / mask_int.sum()
+        return loss
+    
+    def loss_IE(self, outputs):
+        B, C, H, W = outputs.shape
+        
+        probs = outputs.detach().softmax(dim=1)
+        probs_flat = probs.permute(0, 2, 3, 1).reshape(-1, C)
+        log_q = torch.log(self.running_q + 1e-8)
+        
+        lie = (probs_flat * log_q).sum(dim=1)
+        loss = -lie.mean()
+        return loss
+    
     def forward_and_adapt(self, batch):
         """Forward and adapt model on batch of data."""
         x, y, shape_, name_ = batch
-
-        feature, outputs, low_feature = self.net(x, feat=True, edge=True)
+        
+        # save_path = '/kaggle/working/DIGA/output'
         # with torch.no_grad():
-        # feature, outputs = self.net(x, feat=True)
+        #     print('name:', name_[0])
+        #     self.visualize_tensor(prob_mask[0], save_path, 'prob_mask.png')
+        #     self.visualize_tensor(outputs_1[0], save_path, 'outputs_1.png')
+        #     self.visualize_tensor(outputs_2[0], save_path, 'outputs_2.png')
+        #     print('done visualize')
         
         to_logs = {}
-        outputs_proto, to_logs_ = self.multi_proto_label(
-            feature,
-            outputs, 
-            y, 
-            self.hparams.dataset_info.class_names,
-            self.hparams.cfg,
-        )
-
-        # outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs.softmax(1) * (1 - self.hparams.cfg.
-        # fusion_lambda)
-        outputs_softmax = outputs.softmax(1)
-        fused_outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs_softmax * (1 - self.hparams.cfg.fusion_lambda)
-
+        
         if self.training:
-            # low_confident_regions = self.extract_and_save_regions(x, fused_outputs)
+            prob_mask, outputs_1, outputs_2 = self.aug(batch)
+            pseudo_labels = outputs_2.argmax(1)
+            loss_SST = self.loss_SST(outputs_2, pseudo_labels, prob_mask)
+            loss_IE = self.loss_IE(outputs_2)
+            loss = loss_SST + self.lie_alpha * loss_IE 
             
-            # new_x, check = self.add_confident_region(x, low_confident_regions)
-            
-            # if check:  
-            #     self.visualize_image(new_x[0], "/root/duc-loi/code/DIGA/output/new_x", name_[0])
-                
-            # _, new_outputs = self.net(new_x, feat=True)
-            
-            pseudo_labels = outputs.argmax(1)
-            # soft_pls = outputs.softmax(1)
-            # soft_pls_sharpened = soft_pls ** 2
-            # soft_pls_sharpened = soft_pls_sharpened / soft_pls_sharpened.sum(dim=1, keepdim=True)
-            # eps = 1e-8
-            # soft_pls_sharpened = soft_pls_sharpened * (1 - eps) + eps / soft_pls_sharpened.size(1)
-       
-            # loss = F.cross_entropy(outputs, soft_pls_sharpened)
-            # pseudo_labels_new = new_outputs.argmax(1)
-            # loss = self.loss(new_outputs, pseudo_labels_new)
-            
-            edge_canny = DIGA.canny_edge_tensor(x).to(self.device)
-            low_feature = low_feature.to(self.device)
-            edge_loss = self.edge_loss(low_feature, edge_canny)
-            # print('loss: ', loss)
-            # print('edge loss: ', edge_loss)
-            loss = 0.7 * self.loss(outputs, pseudo_labels) + edge_loss * 0.3
-            
-            # if self.saved_edges_count < 20:
-                # self.saved_edges_count += 1
-                # self._save_edge_comparison(edge_canny, low_feature, name_)
+            feature, outputs = self.net(x, feat=True)
+            fused_outputs = outputs.softmax(1)
         else:
+            feature, outputs= self.net(x, feat=True)
+            
+            outputs_proto, to_logs_ = self.multi_proto_label(
+                feature,
+                outputs, 
+                y, 
+                self.hparams.dataset_info.class_names,
+                self.hparams.cfg,
+            )
+            outputs_softmax = outputs.softmax(1)
+            fused_outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs_softmax * (1 - self.hparams.cfg.fusion_lambda)
             loss = torch.tensor(0.0, device=self.device)
             
-        # print('fused_outputs shape', fused_outputs.shape)
-        # print('outputs_proto shape', outputs_proto.shape)
-        # self._visualize_outputs(fused_outputs, outputs_proto, name_)
-            
-        return fused_outputs.cpu(), to_logs, feature, loss
+        return fused_outputs.cpu(), to_logs, loss
 
     def test_epoch_end(self, outputs: List[Any]): 
         stats = self._calculate_overall_statistics()
@@ -2440,7 +2356,7 @@ class DIGA(LightningModule):
     def _configure_bn_running_stats(self):
         for param in self.net.parameters():
             param.requires_grad = False
-        
+            
         for m in self.net.modules():
             if isinstance(m, SIFABatchNorm2d):
                 m.lambda_.data = torch.tensor(self.hparams.cfg.bn_lambda)
@@ -2474,70 +2390,6 @@ class DIGA(LightningModule):
             if "wandb" in lg.__module__:
                 return lg
         raise ValueError("No wandb logger found")
-
-    def _visualize_outputs(self, fused_outputs, outputs_proto, name=None):
-        """Visualize fused outputs and prototype outputs.
-        
-        Args:
-            fused_outputs (torch.Tensor): Fused model outputs
-            outputs_proto (torch.Tensor): Prototype-based outputs
-            name (str): Name for saving the visualization
-        """
-        # Convert to numpy if needed
-        # if hasattr(fused_outputs, 'cpu'):
-        #     fused_outputs = fused_outputs.cpu().numpy()
-        #     outputs_proto = outputs_proto.cpu().numpy()
-        
-        # Get first batch
-        fused = fused_outputs[0]
-        proto = outputs_proto[0]
-        
-        # Create figure with 2 rows and 2 columns
-        plt.figure(figsize=(12, 10))
-        
-        # Plot fused outputs
-        plt.subplot(2, 2, 1)
-        plt.imshow(fused.argmax(axis=0), cmap='tab20')
-        plt.title('Fused Outputs (Class Labels)')
-        plt.axis('off')
-        
-        # Plot fused confidence
-        plt.subplot(2, 2, 2)
-        fused_conf = fused.max(axis=0)
-        mask = fused_conf < 0.5
-        fused_c = fused_conf.copy()
-        fused_c[mask] = 0
-        plt.imshow(fused_c, cmap='hot')
-        plt.colorbar(label='Confidence')
-        plt.title('Fused Outputs (Confidence)')
-        plt.axis('off')
-        
-        # Plot prototype outputs
-        plt.subplot(2, 2, 3)
-        plt.imshow(proto.argmax(axis=0), cmap='tab20')
-        plt.title('Prototype Outputs (Class Labels)')
-        plt.axis('off')
-        
-        # Plot prototype confidence
-        plt.subplot(2, 2, 4)
-        proto_conf = proto.max(axis=0)
-        plt.imshow(proto_conf, cmap='hot')
-        plt.colorbar(label='Confidence')
-        plt.title('Prototype Outputs (Confidence)')
-        plt.axis('off')
-        
-        # Save the figure
-        if name is not None:
-            if isinstance(name, tuple):
-                filename = os.path.basename(name[0])
-                filename = os.path.splitext(filename)[0]
-            else:
-                filename = str(name)
-            
-            os.makedirs('/root/duc-loi/code/DIGA/output/outputs', exist_ok=True)
-            save_path = f'/root/duc-loi/code/DIGA/output/outputs/outputs_comparison_{filename}.png'
-            plt.savefig(save_path)
-            plt.close()
 
 if __name__ == "__main__":
     import hydra

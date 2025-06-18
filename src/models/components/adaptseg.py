@@ -181,6 +181,17 @@ class ResNetMulti(nn.Module):
                 m.bias.data.zero_()
                 for i in m.parameters():
                     i.requires_grad = False
+                    
+        self.encoder = nn.Sequential(
+            self.conv1,
+            self.bn1,
+            self.relu,
+            self.maxpool,
+            self.layer1,
+            self.layer2,
+            self.layer3,
+            self.layer4,
+        )
 
     def _make_layer(self, block, planes, blocks, stride=1, dilation=1):
         downsample = None
