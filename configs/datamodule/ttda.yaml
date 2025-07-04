@@ -2,11 +2,11 @@ defaults:
   # - test_list: cityscapes # idd # crosscity # cityscapes # mapillary # cityscapes, bdd, mapillary
   - test_list: cityscapes
 _target_: src.datamodules.ttda_datamodule.Sim2RealSegmentationDataModule
-# data_dir: ${paths.data_dir}
-data_dir: /kaggle/input/cityscape-diga
+data_dir: ${paths.data_dir}
+# data_dir: /kaggle/input/cityscape-diga
 # data_dir: /kaggle/input/bdd100
 #batch_size: 1 # 64
-batch_size: 4
+batch_size: 1
 num_workers: ${oc.decode:${oc.env:NUM_WORKERS}}
 pin_memory: False
 train_list: # ! not used

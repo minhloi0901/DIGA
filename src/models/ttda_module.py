@@ -11,6 +11,7 @@ from torchmetrics.classification.accuracy import Accuracy
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
+import torchvision.transforms.functional as F1
 import logging
 from torch.autograd import Variable
 import abc
@@ -25,6 +26,7 @@ import random
 from tqdm import tqdm
 import time 
 import matplotlib.pyplot as plt
+from PIL import Image, ImageEnhance, ImageOps
 
 logger = logging.getLogger('lightning')
 logging.getLogger('PIL').setLevel(logging.INFO)
@@ -392,28 +394,8 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
     def forward(self, input):
         self._check_input_dim(input)
         
-        # exponential_average_factor = 0.0
-
-        # if self.training and self.track_running_stats:
-        #     if self.num_batches_tracked is not None:
-        #         # self.num_batches_tracked.add_(1) # ! removed at Sept. 2022
-        #         if self.momentum is None:  # use cumulative moving average
-        #             exponential_average_factor = 1.0 / float(self.num_batches_tracked)
-        #         else:  # use exponential moving average
-        #             exponential_average_factor = self.momentum
-
-        # if batch_size > 1
-        # half_first = True
-        # if half_first == True:
-        #     if input.size(0) > 1:
-        #         mean_cur = (input[:1].mean([0, 2, 3]) + input[1:].mean([0, 2, 3])) / 2 # ! note that we should not use batch_size > 1
-        #         var_cur = (input[:1].var([0, 2, 3], unbiased=False) + input[1:].var([0, 2, 3], unbiased=False)) / 2
-        #     else:
-        #         mean_cur = input.mean([0, 2, 3])
-        #         var_cur = input.var([0, 2, 3], unbiased=False)
-        # else:
-        # mean_cur = input.mean([0, 2, 3])
-        # var_cur = input.var([0, 2, 3], unbiased=False)
+        mean_cur = input.mean([0, 2, 3])
+        var_cur = input.var([0, 2, 3], unbiased=False)
         
         if not hasattr(self, 'mean_memory'):
             self.mean_memory = FeatureMemory(self.memory_bank_size) 
@@ -422,17 +404,10 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
         # Update memory banks
         self.update_memory_bank(input)
         mean_cur, var_cur = self.get_memory_bank_stats()
-        # calculate running estimates
-        # n = input.numel() / input.size(1)
-        # if self.training:
-        #     mean, var = mean_cur, var_cur
-        #     with torch.no_grad():
-        #         self.running_mean = exponential_average_factor * mean\
-        #             + (1 - exponential_average_factor) * self.running_mean
+
         mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
         var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
-        # mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
-        # var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
+  
         self.mean = mean.detach() 
         self.var = var.detach()
         # normal train -> update running mean, var. use current mean, var
@@ -1063,7 +1038,7 @@ class DeepLabv2AdaptSeg(adaptseg.ResNetMulti):
                 self.load_source_pretrained(saved_state_dict)
             elif 'my' in self.restore_from.split("/")[-1]:
                 self.load_imagenet_pretrained(saved_state_dict['state_dict'])
-            elif 'baseline' in self.restore_from.split("/")[-1] or 'dl' in self.restore_from.split("/")[-1]:
+            elif 'baseline' in self.restore_from.split("/")[-1] or 'dl' in self.restore_from.split("/")[-1] or 'GTA2Cityscapes_LSGAN' in self.restore_from.split("/")[-1] or 'gta_source_baseline' in self.restore_from.split("/")[-1]:
                 self.load_baseline_pretrained(saved_state_dict)
             else:
                 raise ValueError("Can not find pretrained model type.")
@@ -1693,21 +1668,15 @@ class DIGA(LightningModule):
         # DOT settings
         self.num_classes = self.hparams.dataset_info['num_classes']
         self.z_t = torch.ones(self.num_classes) / self.num_classes
-        # print(f'[DIGA DEBUG] num_classes: {self.num_classes}')
-        self.lambda_dot = cfg.lambda_dot
         
         self.save_hyperparameters(logger=False, ignore=["net"])
         self._replace_bn()
         self._configure_bn_running_stats()
         
-        # Initialize statistics tracking
-        self._init_statistics_tracking()
-        self._init_batch_statistics_tracking()
-        
-        # Initialize class calculation counter
-        self.class_calculation_count = torch.zeros(self.num_classes, device=self.device)
-        # Initialize thresholds array
-        self.calculation_thresholds = torch.tensor([10, 100, 1000, 2500, 10000], device=self.device)
+        # Augmentation config
+        self.severity = 2.0
+        self.mean = torch.tensor([128.0, 128.0, 128.0]).view(3, 1, 1)
+        self.std = torch.tensor([1.0, 1.0, 1.0]).view(3, 1, 1)
     
     # lightning callback
     def on_test_start(self):
@@ -1720,48 +1689,6 @@ class DIGA(LightningModule):
         if isinstance(outputs, tuple):
             outputs = outputs[-1]
         return outputs
-    
-    # DOT
-    def dot_loss(self, outputs):
-        """
-        Compute the DOT (Dynamic Online reweightTing) loss for a batch.
-        Args:
-            outputs: (B, C, H, W) logits
-        Returns:
-            loss: scalar tensor
-        """
-        logits_flat = outputs.mean(dim=(2, 3))
-
-        probs = torch.softmax(logits_flat, dim=1)
-        pred_classes = probs.argmax(dim=1)
-        B = probs.shape[0]
-        # entropy for each sample
-        logp = torch.log(probs + 1e-8)
-        entropys = -(probs * logp).sum(dim=1)
-        
-        # DOT weights
-        class_weight = 1. / (self.z_t + 1e-8)
-        class_weight = class_weight / class_weight.sum()
-        sample_weight = class_weight[pred_classes]
-        sample_weight = sample_weight / sample_weight.sum() * B
-        
-        ent_weight = torch.ones_like(sample_weight)
-
-        total_weight = sample_weight * ent_weight
-        use_idx = torch.ones_like(total_weight, dtype=torch.bool)
-        loss = (entropys * total_weight)[use_idx].mean()
-        print(f"[DIGA DEBUG] loss: {loss}")
-        # print("logits_flat", logits_flat)
-        # print("probs", probs)
-        # print("pred_classes", pred_classes)
-        # print("self.z_t", self.z_t)
-        # print("class_weight", class_weight)
-        # print("sample_weight", sample_weight)
-        # Update z_t
-        with torch.no_grad():
-            p_mean = probs.mean(dim=0)
-            self.z_t = self.lambda_dot * self.z_t + (1 - self.lambda_dot) * p_mean
-        return loss
 
     def step(self, batch: Any):
         x, y, shape_, name_ = batch
@@ -1775,10 +1702,6 @@ class DIGA(LightningModule):
     def test_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
         x, y, shape_, name_ = batch
         loss, preds, targets, info, feature = self.step(batch)
-        
-        # Store features and labels for visualization
-        self.last_features = feature
-        self.last_labels = targets
         
         # log test metrics
         acc = self.test_acc[dataloader_idx](preds, targets)
@@ -1798,11 +1721,17 @@ class DIGA(LightningModule):
         """
         x, y = pair
         # no_grad
+        x2 = x.detach()
+        x2 = self.randaugment_color_jitter(x2)
         feature, outputs = self.net(x, feat=True)
+        # aug
+        feature2, outputs2 = self.net(x2, feat=True)
+        
         to_logs = {}
         outputs_proto, to_logs_ = self.multi_proto_label(
-            feature,
-            outputs, 
+            feature2,
+            outputs,
+            outputs2, 
             y, 
             self.hparams.dataset_info.class_names,
             self.hparams.cfg,
@@ -1812,23 +1741,6 @@ class DIGA(LightningModule):
         return outputs.cpu(), to_logs, feature
 
     def test_epoch_end(self, outputs: List[Any]):
-        # Plot batch statistics
-        self._plot_batch_statistics()
-        
-        # Create and save confident pixels plots
-        self._plot_confident_pixels_statistics()
-        
-        # Calculate and print statistics
-        stats = self._calculate_overall_statistics()
-        self._print_statistics(stats)
-        
-        # Calculate and print class balance statistics
-        self._print_class_balance_statistics()
-        
-        # Reset all statistics for next epoch
-        self._init_statistics_tracking()
-        self._reset_batch_statistics()
-        
         test_accs = [test_acc.compute() for test_acc in self.test_acc]
         acc_mean = sum(test_accs) / len(test_accs)
         self.log("test/acc/mean", acc_mean, on_step=False, on_epoch=True, prog_bar=True)
@@ -1841,140 +1753,22 @@ class DIGA(LightningModule):
             class_names = self.hparams.dataset_info.class_names
             self.wandb.log_table(key=f"test/class_iou/dataloaderr_idx_{str(i)}", columns=list(class_names), data=[class_iou])
         for i, test_acc in enumerate(self.test_acc): # reset
-            test_acc.reset()
-        
-    def _init_statistics_tracking(self):
-        """Initialize lists for tracking statistics across test images."""
-        self.confident_pixels_per_image = []
-        self.total_pixels_per_image = []
-        self.image_indices = []
-        
-    def _update_statistics(self, above_threshold: int, total_pixels: int):
-        """Update statistics for a single image.
-        
-        Args:
-            above_threshold: Number of pixels above confidence threshold
-            total_pixels: Total number of pixels in the image
-        """
-        self.confident_pixels_per_image.append(above_threshold)
-        self.total_pixels_per_image.append(total_pixels)
-        self.image_indices.append(len(self.image_indices))
-        
-    def _calculate_overall_statistics(self) -> dict:
-        """Calculate and return overall statistics.
-        
-        Returns:
-            Dictionary containing overall statistics
-        """
-        total_confident = sum(self.confident_pixels_per_image)
-        total_pixels = sum(self.total_pixels_per_image)
-        avg_percentage = total_confident / total_pixels * 100
-        
-        return {
-            'total_images': len(self.image_indices),
-            'avg_confident_pixels': total_confident/len(self.image_indices),
-            'avg_percentage': avg_percentage
-        }
-        
-    def _plot_confident_pixels_statistics(self):
-        """Create and save plots showing confident pixels statistics."""
-        plt.figure(figsize=(15, 5))
-        
-        # Plot 1: Number of confident pixels per image
-        plt.subplot(1, 2, 1)
-        plt.plot(self.image_indices, self.confident_pixels_per_image, 'b-', label='Confident Pixels')
-        plt.title('Number of Confident Pixels per Image')
-        plt.xlabel('Image Index')
-        plt.ylabel('Number of Pixels')
-        plt.grid(True)
-        
-        # Plot 2: Percentage of confident pixels per image
-        percentages = [conf/total*100 for conf, total in zip(self.confident_pixels_per_image, self.total_pixels_per_image)]
-        # store confident pixels and total pixels in csv 
-        with open('confident_pixels_statistics.csv', 'w') as f:
-            f.write('Image Index, Confident Pixels, Total Pixels\n')
-            for i, (conf, total) in enumerate(zip(self.confident_pixels_per_image, self.total_pixels_per_image)):
-                f.write(f'{i}, {conf}, {total}\n')
-        plt.subplot(1, 2, 2)
-        plt.plot(self.image_indices, percentages, 'r-', label='Percentage')
-        plt.title('Percentage of Confident Pixels per Image')
-        plt.xlabel('Image Index')
-        plt.ylabel('Percentage (%)')
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig('confident_pixels_statistics.png')
-        plt.close()
-        
-    def _print_statistics(self, stats: dict):
-        """Print statistics in a formatted way.
-        
-        Args:
-            stats: Dictionary containing statistics to print
-        """
-        print(f"\nOverall Statistics:")
-        print(f"Total number of images: {stats['total_images']}")
-        print(f"Average confident pixels per image: {stats['avg_confident_pixels']:.0f}")
-        print(f"Average percentage of confident pixels: {stats['avg_percentage']:.2f}%")
-        
-    def high_confident_proto_label(self, outputs, threshold, number_of_prototypes):
-        """High confident pseudo label.
-        For each pixel, output the max prob class if max_prob > bar, else 255
-        
-        Args:
-            outputs: (B, C, H, W), logits
-            bar: float, threshold
-            class_balance: bool, if True, use class balance to select the max prob class
-            ground_truth: (B, H, W), ground truth label
-        Returns:
-            pseudo_label: (B, H, W)
-        """
-        # Convert logits to probabilities using softmax
-        outputs = outputs.softmax(dim=1)
-        pseudo_label = outputs.argmax(dim=1)
-        
-        # top2_probs, top2_indices = torch.topk(outputs, k=2, dim=1)
-        # conf_diff = top2_probs[:, 0] - top2_probs[:, 1]
-        # Calculate number of pixels above threshold for each image in the batch
-        max_probs = outputs.max(dim=1)[0]  # Shape: (B, H, W)
-        
-        # Calculate number of pixels to keep per image
-        total_pixels_per_image = max_probs[0].numel()  # H * W
-        k_pixels = int(total_pixels_per_image * number_of_prototypes)  # Number of pixels to keep
-        
-        # Initialize mask for confident pixels
-        confident_mask = torch.zeros_like(max_probs, dtype=torch.bool)
-        
-        # Process each image in the batch for top-k pixels
-        for i in range(max_probs.shape[0]):
-            # Flatten probabilities for this image
-            flat_probs = max_probs[i].flatten()
-            
-            # Get indices of top k pixels
-            _, top_indices = torch.topk(flat_probs, k_pixels)
-            
-            # Create mask for this image
-            img_mask = torch.zeros_like(flat_probs, dtype=torch.bool)
-            img_mask[top_indices] = True
-            
-            # Reshape mask back to image dimensions
-            confident_mask[i] = img_mask.reshape(max_probs[i].shape)
-        
-        # Process confident pixels for smaller than threshold
-        confident_mask = confident_mask & (max_probs > threshold)
-        # confident_mask = confident_mask & (conf_diff > threshold)
+            test_acc.reset()   
     
-        # Update statistics
-        above_threshold = confident_mask.sum().item()
-        total_pixels = confident_mask.numel()
-        self._update_statistics(above_threshold, total_pixels)
+    def high_confident_proto_label(self, outputs1, outputs2, threshold):
+        outputs2 = outputs2.softmax(dim=1)
         
-        # Set non-confident pixels to 255
-        pseudo_label[~confident_mask] = 255
+        pseudo_label1 = outputs1.argmax(dim=1)
+        pseudo_label2 = outputs2.argmax(dim=1)
+        
+        pseudo_label = pseudo_label2.clone()
+        
+        pseudo_label[pseudo_label1 != pseudo_label2] = 255
+        pseudo_label[outputs2.max(dim=1)[0] < threshold] = 255
         
         return pseudo_label
     
-    def multi_proto_label(self, feature, outputs, y, class_names, cfg):
+    def multi_proto_label(self, feature, outputs1, outputs2, y, class_names, cfg):
         """ Calculate label for each pixel based on multiple prototypes of each class
         Args:
             feature: (B, CH, H, W), feature map
@@ -1991,18 +1785,24 @@ class DIGA(LightningModule):
 
         """
         multi_pred, to_logs = None, {}
-        y = F.interpolate(y.unsqueeze(1).float(), size=outputs.shape[2:], mode="nearest").squeeze(1).long()
+        
         proto_label = self.high_confident_proto_label(
-            outputs, 
-            threshold=cfg.confidence_threshold, 
-            number_of_prototypes=cfg.number_of_prototypes
+            outputs1,
+            outputs2, 
+            threshold=cfg.confidence_threshold
         )
-        proto, exists_flag = self.cal_proto(feature, proto_label)
+        proto, exists_flag = self.cal_proto(
+            feature,
+            proto_label, 
+            outputs1, 
+            ratio=cfg.top_k
+        )
+        
         # init or update mean prototypes
         if not hasattr(self, "classifier_running_proto"):
             self.classifier_running_proto, self.classifier_running_proto_exists_flag = proto, exists_flag
         else:
-            self.classifier_running_proto, self.classifier_running_proto_exists_flag = self._update_classifier_proto(feature, proto_label, self.classifier_running_proto, self.classifier_running_proto_exists_flag, cfg.proto_rho)
+            self.classifier_running_proto, self.classifier_running_proto_exists_flag = self._update_classifier_proto(proto, exists_flag, self.classifier_running_proto, self.classifier_running_proto_exists_flag, cfg.proto_rho)
         # make prediction
         instance_pred = self.cal_pred_of_proto(feature, proto, exists_flag)
         mean_pred = self.cal_pred_of_proto(feature, self.classifier_running_proto, self.classifier_running_proto_exists_flag)
@@ -2038,7 +1838,7 @@ class DIGA(LightningModule):
         return weight
 
     @torch.no_grad()
-    def _update_classifier_proto(self, feature, y, classifier_proto, classifier_proto_exists_flag, rho=None):
+    def _update_classifier_proto(self, proto, with_flag, classifier_proto, classifier_proto_exists_flag, rho=None):
         """Update the prototype of the classifier.
         Args:
             feature: [B, CH, H, W]
@@ -2056,8 +1856,6 @@ class DIGA(LightningModule):
             feature: [B, C, H, W]
             y: [B, H, W]
         """
-        # calculate mean of each class
-        proto, with_flag = self.cal_proto(feature, y)
         # update (set for the first time, update for the rest) 
         for i in range(self.hparams.dataset_info["num_classes"]):
             if not with_flag[i] or rho == 0: continue
@@ -2065,30 +1863,8 @@ class DIGA(LightningModule):
                 classifier_proto[i] = proto[i]
                 classifier_proto_exists_flag[i] = 1
             else:
-                # Adjust rho based on calculation count
-                count = self.class_calculation_count[i]
-                # Find the position in thresholds array
-                pos = torch.sum(count > self.calculation_thresholds)
-                adjusted_rho = 0.5 - (pos * 0.1)  # Start from 0.5 and decrease by 0.1 for each threshold
-                adjusted_rho = max(adjusted_rho, 0.1)  # Ensure minimum rho is 0.1
-                classifier_proto[i] = (1-adjusted_rho) * classifier_proto[i] + adjusted_rho * proto[i]
-                self.class_calculation_count[i] += 1
+                classifier_proto[i] = (1-rho) * classifier_proto[i] + rho * proto[i]
         return classifier_proto, classifier_proto_exists_flag 
-
-    def fidelity(self, feature, proto):
-        """ Calculate the fidelity of the feature and the prototype.
-        Args:
-            feature: [B, CH, H, W]
-            proto: [C, CH]
-        Returns:
-            fidelity: [B, C, H, W]
-        """
-        feature_norm = feature / np.linalg.norm(feature, axis=1, keepdims=True)
-        proto_norm = proto / np.linalg.norm(proto, axis=1, keepdims=True)
-        
-        # Compute the fidelity
-        fidelity = (feature_norm @ proto_norm) ** 2
-        return fidelity
 
     @torch.no_grad()
     def proto_weight(self, proto, feature, tau=1.0):
@@ -2112,7 +1888,7 @@ class DIGA(LightningModule):
         weight = torch.softmax(-dist / tau, dim=1)
         return weight
 
-    def cal_proto(self, feature, y):
+    def cal_proto(self, feature, y, outputs, ratio=0.5):
         """ Calculate the prototype of each class with the given feature and label.
         Args:
             feature: [B, C, H, W]
@@ -2121,14 +1897,29 @@ class DIGA(LightningModule):
             proto: [C, C] # prototype of each class
             with_flag: [C] # whether the class has pixels
         """
-        proto = torch.zeros(self.hparams.dataset_info["num_classes"], feature.shape[1]).to(self.device)
-        with_flag = torch.zeros(self.hparams.dataset_info["num_classes"]).to(self.device)
-        for i in range(self.hparams.dataset_info["num_classes"]):
-            masks = (y == i).flatten()
-            if masks.sum() == 0:
+        num_classes = self.hparams.dataset_info["num_classes"]
+        proto = torch.zeros(num_classes, feature.shape[1]).to(self.device)
+        with_flag = torch.zeros(num_classes).to(self.device)
+      
+        feature_flat = feature.permute((0, 2, 3, 1)).reshape(-1, feature.shape[1])
+        outputs_flat = outputs.permute((0, 2, 3, 1)).reshape(-1, num_classes)
+        
+        for i in range(num_classes):
+            mask = (y == i).flatten()
+            num_pixels = mask.sum().item()
+            if mask.sum() == 0:
                 continue
             with_flag[i] = 1
-            proto[i] = feature.permute((1, 0, 2, 3)).flatten(1).permute((1,0))[masks].mean(0)
+            
+            topk = max(1, int(ratio * num_pixels))
+            conf = outputs_flat[mask, i]
+            
+            # get topk pixels based on conf pixel
+            topk_vals, topk_idx = torch.topk(conf, topk, largest=True, sorted=True)
+            selected_feat = feature_flat[mask][topk_idx]
+            
+            proto[i] = selected_feat.mean(dim=0)
+            
         return proto, with_flag
     
     # utils operation
@@ -2161,6 +1952,58 @@ class DIGA(LightningModule):
             if isinstance(module, nn.BatchNorm2d):
                 set_layer(self.net, n, SIFABatchNorm2dTrainable().from_bn(module).to(self.device))
     
+    def unnormalize(self, x):
+        return (x * self.std.to(x.device)) + self.mean.to(x.device)
+    
+    def normalize(self, x):
+        return (x - self.mean.to(x.device)) / self.std.to(x.device)
+    
+    def autocontrast(self, img, severity):
+        return ImageOps.autocontrast(img)
+
+    def equalize(self, img, severity):
+        return ImageOps.equalize(img)
+
+    def brightness(self, img, severity):
+        enhancer = ImageEnhance.Brightness(img)
+        factor = 1 + (severity / 30) * 1.8
+        return enhancer.enhance(factor)
+    
+    def sharpness(self, img, severity):
+        enhancer = ImageEnhance.Sharpness(img)
+        factor = 1 + (severity / 30) * 1.8
+        return enhancer.enhance(factor)
+    
+    def randaugment_color_jitter(self, x):
+        is_batched = (x.dim() == 4)
+        if is_batched:
+            x = x.squeeze(0) # [1, C, H, W] -> [C, H, W]
+        
+        x_unnorm = self.unnormalize(x)
+        x_unnorm = x_unnorm.clamp(0, 255)
+        x_uint8 = x_unnorm.byte()
+        
+        img = F1.to_pil_image(x_uint8.cpu())
+        transforms = [
+            (self.autocontrast, "AutoContrast"),
+            (self.equalize, "Equalize"),
+            (self.brightness, "Brightness"),
+            (self.sharpness, "Sharpness")
+        ]
+
+        transform, name = random.choice(transforms)
+        # transform, name = transforms[3]
+        # print(f"Applying transform: {name}")
+        
+        img = transform(img, self.severity)
+        img_tensor = F1.to_tensor(img).to(x.device) * 255
+        
+        img_tensor = self.normalize(img_tensor)
+        
+        if is_batched:
+            img_tensor = img_tensor.unsqueeze(0)
+        return img_tensor
+    
     # others
     @property
     def wandb(self):
@@ -2168,231 +2011,6 @@ class DIGA(LightningModule):
             if "wandb" in lg.__module__:
                 return lg
         raise ValueError("No wandb logger found")
-
-    def visualize_prototypes(self):
-        """Visualize the prototypes for each class using matplotlib.
-        Creates a grid of plots showing the feature dimensions for each class's prototype.
-        """
-        if not hasattr(self, "classifier_running_proto"):
-            print("No prototypes available yet")
-            return
-            
-        proto = self.classifier_running_proto.cpu().numpy()
-        exists_flag = self.classifier_running_proto_exists_flag.cpu().numpy()
-        num_classes = proto.shape[0]
-        feature_dim = proto.shape[1]
-        
-        # Create a grid of subplots
-        n_cols = 4  # Number of columns in the grid
-        n_rows = (num_classes + n_cols - 1) // n_cols  # Calculate required rows
-        
-        plt.figure(figsize=(15, 4*n_rows))
-        
-        for i in range(num_classes):
-            plt.subplot(n_rows, n_cols, i+1)
-            
-            if exists_flag[i]:
-                # Plot the prototype features
-                plt.plot(proto[i], 'b-', label='Prototype')
-                plt.title(f'Class {i} ({self.hparams.dataset_info.class_names[i]})')
-                plt.grid(True)
-            else:
-                plt.text(0.5, 0.5, 'No prototype', 
-                        horizontalalignment='center',
-                        verticalalignment='center',
-                        transform=plt.gca().transAxes)
-                plt.title(f'Class {i} ({self.hparams.dataset_info.class_names[i]})')
-            
-            if i == 0:  # Only add legend to first plot
-                plt.legend()
-        
-        plt.tight_layout()
-        plt.savefig('prototypes.png')
-        plt.close()
-
-    def visualize_feature_clusters(self, features, labels, n_samples=1000):
-        """Visualize feature clusters using t-SNE.
-        Args:
-            features: [B, CH, H, W] feature tensor
-            labels: [B, H, W] label tensor
-            n_samples: number of samples to visualize (for performance)
-        """
-        # Move tensors to CPU
-        features = features.cpu()
-        labels = labels.cpu()
-        
-        # Get original shapes
-        B, CH, H, W = features.shape
-        
-        # First sample points to reduce memory usage
-        total_points = B * H * W
-        if total_points > n_samples:
-            # Calculate sampling ratio
-            ratio = n_samples / total_points
-            # Sample indices
-            flat_indices = np.random.choice(total_points, n_samples, replace=False)
-            # Convert to 3D indices
-            b_idx = flat_indices // (H * W)
-            h_idx = (flat_indices % (H * W)) // W
-            w_idx = flat_indices % W
-            
-            # Sample features and labels
-            features = features[b_idx, :, h_idx, w_idx]  # [n_samples, CH]
-            labels = labels[b_idx, h_idx, w_idx]  # [n_samples]
-        else:
-            # Reshape if no sampling needed
-            features = features.permute(0, 2, 3, 1).reshape(-1, CH)  # [B*H*W, CH]
-            labels = labels.reshape(-1)  # [B*H*W]
-        
-        # Convert to numpy
-        features = features.numpy()
-        labels = labels.numpy()
-        
-        # Remove invalid labels (255)
-        valid_mask = labels != 255
-        features = features[valid_mask]
-        labels = labels[valid_mask]
-        
-        # Apply t-SNE
-        from sklearn.manifold import TSNE
-        tsne = TSNE(n_components=2, random_state=42)
-        features_2d = tsne.fit_transform(features)
-        
-        # Plot with class names
-        plt.figure(figsize=(15, 10))
-        
-        # Create scatter plot for each class
-        class_names = self.hparams.dataset_info.class_names
-        unique_labels = np.unique(labels)
-        
-        # Use a colormap that's distinct for many classes
-        colors = plt.cm.tab20(np.linspace(0, 1, len(class_names)))
-        
-        for idx, label in enumerate(unique_labels):
-            if label == 255:  # Skip invalid labels
-                continue
-            mask = labels == label
-            plt.scatter(features_2d[mask, 0], features_2d[mask, 1], 
-                       c=[colors[label]], label=class_names[label],
-                       alpha=0.6, s=50)
-        
-        plt.title('Feature Space Clusters (t-SNE)')
-        plt.xlabel('t-SNE 1')
-        plt.ylabel('t-SNE 2')
-        plt.grid(True)
-        
-        # Add legend outside of plot
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
-        plt.tight_layout()
-        
-        plt.savefig('feature_clusters.png', bbox_inches='tight', dpi=300)
-        plt.close()
-
-    def visualize_prototype_distances(self):
-        """Visualize distances between prototypes as a heatmap.
-        """
-        if not hasattr(self, "classifier_running_proto"):
-            print("No prototypes available yet")
-            return
-            
-        proto = self.classifier_running_proto.cpu().numpy()
-        exists_flag = self.classifier_running_proto_exists_flag.cpu().numpy()
-        
-        # Calculate pairwise distances
-        from scipy.spatial.distance import pdist, squareform
-        distances = squareform(pdist(proto))
-        
-        # Create mask for non-existent prototypes
-        mask = np.zeros_like(distances, dtype=bool)
-        for i in range(len(exists_flag)):
-            for j in range(len(exists_flag)):
-                if not exists_flag[i] or not exists_flag[j]:
-                    mask[i, j] = True
-        
-        # Plot heatmap
-        plt.figure(figsize=(12, 10))
-        plt.imshow(distances, cmap='viridis')
-        plt.colorbar(label='Distance')
-        
-        # Add class names
-        class_names = self.hparams.dataset_info.class_names
-        plt.xticks(range(len(class_names)), class_names, rotation=45, ha='right')
-        plt.yticks(range(len(class_names)), class_names)
-        
-        # Add mask for non-existent prototypes
-        plt.imshow(mask, cmap='binary', alpha=0.3)
-        
-        plt.title('Prototype Pairwise Distances')
-        plt.tight_layout()
-        plt.savefig('prototype_distances.png')
-        plt.close()
-
-    def _init_batch_statistics_tracking(self):
-        """Initialize lists for tracking batch statistics."""
-        self.forward_means = []
-        self.forward_vars = []
-        self.batch_indices = []
-        
-    def _update_batch_statistics(self, mean: float, var: float):
-        """Update batch statistics.
-        
-        Args:
-            mean: Mean value for the current batch
-            var: Variance value for the current batch
-        """
-        self.forward_means.append(mean)
-        self.forward_vars.append(var)
-        self.batch_indices.append(len(self.batch_indices))
-        
-    def _plot_batch_statistics(self):
-        """Create and save plots showing batch statistics."""
-        if not self.forward_means:
-            return
-            
-        plt.figure(figsize=(15, 5))
-        
-        # Plot 1: Mean over batches
-        plt.subplot(1, 2, 1)
-        plt.plot(self.batch_indices, self.forward_means, 'g-', label='Mean')
-        plt.title('SIFA BN Forward Step Mean over Batches')
-        plt.xlabel('Batch Index')
-        plt.ylabel('Mean')
-        plt.grid(True)
-        
-        # Plot 2: Variance over batches
-        plt.subplot(1, 2, 2)
-        plt.plot(self.batch_indices, self.forward_vars, 'm-', label='Variance')
-        plt.title('SIFA BN Forward Step Variance over Batches')
-        plt.xlabel('Batch Index')
-        plt.ylabel('Variance')
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig('bn_stats.png')
-        plt.close()
-        
-    def _reset_batch_statistics(self):
-        """Reset batch statistics tracking."""
-        self.forward_means = []
-        self.forward_vars = []
-        self.batch_indices = []
-    
-    def _print_class_balance_statistics(self):
-        """Save class balance statistics to a CSV file."""
-        import csv
-        
-        if hasattr(self, 'confident_class_counts'):
-            total_counts = torch.stack(self.confident_class_counts).sum(dim=0)
-            class_names = self.hparams.dataset_info.class_names
-            csv_path = "confident_class_balance.csv"
-            with open(csv_path, mode='w', newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(['ClassName', 'ConfidentPixelCount'])
-                for i, count in enumerate(total_counts):
-                    class_name = class_names[i] if i < len(class_names) else str(i)
-                    writer.writerow([class_name, int(count.item())])
-            del self.confident_class_counts
-        
 
 if __name__ == "__main__":
     import hydra

@@ -6,7 +6,6 @@ cfg:
   proto_lambda: 0.8
   fusion_lambda: 0.8 # best
   confidence_threshold: 0.9
-  number_of_prototypes: 0.7 # best
-  proto_rho: 0.4 # best
-  lambda_dot: 0.9
+  top_k: 1.0 # best
+  proto_rho: 0.1 # best
   memory_bank_size: 32
