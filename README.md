@@ -1,6 +1,4 @@
-# 🦸🏻‍♀️ DIGA  - Dynamically Instance-Guided Adaptation: A Backward-free Approach for Test-Time Domain Adaptive Semantic Segmentation
-
-We are still working on this repo now.
+# 🦸🏻‍♀️ DEGA  - Dynamic Entropy Guided Adaptation
 
 # Environment Setup
 
@@ -142,30 +140,19 @@ $UDATADIR
 1. Download pre-trained models
 2. Organize the files in the following structure.
 
-Source models are required to be put in specific directory for running. The pre-trained models are available here ([link](https://www.dropbox.com/s/gpzm15ipyt01mis/DA_Seg_models.zip?dl=0)). 
-
-ps. We use consistent models from previous work of this repo [link](https://github.com/wasidennis/AdaptSegNet).
+Source models are required to be put in specific directory for running. The pre-trained models are available here ([link](https://drive.google.com/drive/folders/1fCQiT2RluY6BoibFTEBHW6j10aX3rhF9?usp=sharing)). 
 
 ```python
 $UDATADIR
 ├── models # create a new folder called "models" under $UDATADIR 
     ├── DA_Seg_models # downloaded from above link
         ├── GTA5
-        ├── GTA5_baseline.pth
+            ├── gta_source_baseline.pth
         ├── SYNTHIA
-        ├── SYNTHIA_source.pth
+            ├── synthia_baseline.pth
         ├── ...
 ├── ...
 ├── BDD
-```
-
-The following cmd would do this automatically:
-
-```python
-mkdir -p $UDATADIR/models
-cd $UDATADIR/models
-wget -O download.zip https://www.dropbox.com/s/gpzm15ipyt01mis/DA_Seg_models.zip?dl=0https://www.dropbox.com/s/gpzm15ipyt01mis/DA_Seg_models.zip?dl=0
-unzip download.zip -d ./
 ```
 
 ps. adding, deleting, editing path could be done at `configs/model/net/gta5_source.yaml`
@@ -240,9 +227,9 @@ Output Example:
 ```python
 wandb: Run summary:
 ...
-wandb: test/acc/dataloaderr13_idx_0 55.01257 # mIoU of 13 class
-wandb: test/acc/dataloaderr16_idx_0 49.24151 # mIoU of 16 class
-wandb:   test/acc/dataloaderr_idx_0 45.81422 # mIoU of 19 class
+wandb: test/acc/dataloaderr13_idx_0 61.99512 # mIoU of 13 class
+wandb: test/acc/dataloaderr16_idx_0 56.23816 # mIoU of 16 class
+wandb:   test/acc/dataloaderr_idx_0 53.21607 # mIoU of 19 class
 ...
 ```
 
@@ -256,18 +243,19 @@ python src/train.py \
     experiment=ttda \
     model/net=gta5_source \
     datamodule/test_list=cityscapes \
-    model.cfg.bn_lambda=0.8 \
+    model.cfg.bn_lambda=0.9 \
     model.cfg.proto_lambda=0.8 \
-    model.cfg.fusion_lambda=0.8 \
+    model.cfg.fusion_lambda=0.4 \
     model.cfg.confidence_threshold=0.9 \
-    model.cfg.proto_rho=0.1
+    model.cfg.proto_rho=0.5 \
+    model.cfg.bn_bank_size=32
 ```
 
 The available choices are listed as following:
 
 - Source model:
 
-  `model/net=gta5_source,synthia_source,gta5_synthia_source`
+  `model/net=gta5_source,synthia_source`
 
 - Target dataset:
 
@@ -275,14 +263,16 @@ The available choices are listed as following:
 
 - Hyper-Paramerters:
 
-  bn_lambda: 0-1 (default 0.8)
+  bn_lambda: 0-1 (default 0.9)
 
   proto_lambda: 0-1 (default 0.8)
 
-  fusion_lambda: 0-1 (default 0.8)
+  fusion_lambda: 0-1 (default 0.4)
 
-  confidence_threshold: 0-1 (default 0.9)
+  confidence_threshold: 0-1 (default 0.9) (called beta in our paper)
 
-  proto_rho: 0-1 (default 0.1)
+  proto_rho: 0-1 (default 0.5)
+
+  bn_bank_size: 2-64 (default 32)
 
 ps. File based customization is also supported by modifying `configs/model/diga.yaml` . Note that the cmd line has higher priority if there are conflicting options.
