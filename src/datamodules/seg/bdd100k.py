@@ -183,8 +183,8 @@ def make_dataset(root, mode_input, maxSkip=0, cv_split=0):
     assert mode in ['train', 'val', 'test', 'trainval', 'small']
     img_path = os.path.join(root, 'images/10k') # TODO
     mask_path = os.path.join(root, 'labels/sem_seg/masks')
-    # mask_postfix = '_train_id.png'
-    mask_postfix = '.png'
+    mask_postfix = '_train_id.png'
+    # mask_postfix = '.png'
     # cv_splits = make_cv_splits(img_dir_name)
     if mode == 'trainval':
         modes = ['train', 'val']
@@ -302,7 +302,7 @@ class BDD100KDataSet(BaseDataset):
             # Convert to tensor and normalize
             img = torch.from_numpy(img).float().permute(2, 0, 1)
             mask_copy = torch.from_numpy(mask_copy).int().squeeze()
-            return img, mask_copy, "", ""
+            return img, mask_copy, "", img_name
         
         # Convert mask back to PIL Image for transforms
         mask = Image.fromarray(mask_copy.astype(np.uint8))

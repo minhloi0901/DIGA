@@ -350,6 +350,7 @@ class MapillaryDataSet(BaseDataset):
 
         mask = torch.from_numpy(np.array(mask)).int().squeeze()
         img = img.permute((2, 0, 1)).float()
+        return img, mask, mask_aux, img_name
         return img, mask, img_name, mask_aux
 
     def __len__(self):

@@ -5,4 +5,4 @@ export CUDA_VISIBLE_DEVICES=0,1
 python3 src/train.py \
     experiment=ttda \
     model/net=gta5_source \
-    datamodule/test_list=bdd
+    datamodule/test_list=cityscapes

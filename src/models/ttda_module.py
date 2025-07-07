@@ -28,6 +28,7 @@ import time
 import matplotlib.pyplot as plt
 from PIL import Image, ImageEnhance, ImageOps
 import math
+import os
 
 logger = logging.getLogger('lightning')
 logging.getLogger('PIL').setLevel(logging.INFO)
@@ -357,37 +358,14 @@ class SIFABatchNorm2d(CustomBatchNorm2d):
                  affine=True, track_running_stats=True):
         super().__init__(num_features, eps, momentum, affine, track_running_stats)
 
-    def update_memory_bank(self, input, entropy):
-        batch_size = input.size(0)
-        for i in range(batch_size):
-            img_mean = input[i].mean([1, 2]) 
-            img_var = input[i].var([1, 2], unbiased=False) 
-            entropy_val = entropy[i]
-            self.memory.add(img_mean, img_var, entropy_val)
-
     def forward(self, input):
         self._check_input_dim(input)
         
         if not hasattr(self, 'memory'):
             self.memory = FeatureMemory(self.memory_bank_size)
             
-        mean_now = input.mean([0, 2, 3])
-        var_now = input.var([0, 2, 3], unbiased=False)
-        k = len(self.memory)
-        mean_mem, var_mem = self.memory.get_stats()
-        
-        if mean_mem is None or k == 0:
-            mean_cur = mean_now
-            var_cur = var_now
-        else:
-            B = input.size(0)
-            mean_cur = (k * mean_mem + B * mean_now) / (k + B)
-            var_cur = (k * var_mem + B * var_now) / (k + B)
-
-        entropy = getattr(self, 'entropy_for_forward', None)
-        if entropy is not None:
-            self.update_memory_bank(input, entropy)
-            del self.entropy_for_forward
+        mean_cur = input.mean([0, 2, 3])
+        var_cur = input.var([0, 2, 3], unbiased=False)
             
         mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
         var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
@@ -1609,51 +1587,6 @@ class SegmentationMultiLevelModule(SegmentationBasicModule):
                 "frequency": 1,
             }
         }
-
-class PrototypeMemory(nn.Module):
-    def __init__(self, max_size: int, num_classes: int):
-        super().__init__()
-        self.max_size = max_size
-        self.num_classes = num_classes
-        self.memory = {i: [] for i in range(num_classes)}
-    
-    def cal_heuristic(self, entropy, age, alpha_t=1.0, alpha_u=1.0, num_classes=19):
-        sigmoid_age = 1 / (1 + math.exp(-age / (self.max_size + 1)))
-        heuristic = alpha_t * sigmoid_age + alpha_u * (entropy / math.log(num_classes))
-        return heuristic
-    
-    def add(self, proto, entropy, class_idx, remove_random=False):
-        entry = (proto.detach().clone(), entropy, 0)
-        
-        for i in range(len(self.memory[class_idx])):
-            p, e, a = self.memory[class_idx][i]
-            self.memory[class_idx][i] = (p, e, a + 1)
-        
-        if len(self.memory[class_idx]) < self.max_size:
-            self.memory[class_idx].append(entry)
-        else:
-            if remove_random:
-                rand_index = random.randint(0, len(self.memory[class_idx]) - 1)
-                self.memory[class_idx][rand_index] = entry
-            else:
-                heuristic_new = self.cal_heuristic(entropy, 0)
-                heuristic_list = [self.cal_heuristic(e, a) for (_, e, a) in self.memory[class_idx]]
-                max_heuristic = max(heuristic_list)
-                max_index = heuristic_list.index(max_heuristic)
-
-                if heuristic_new < max_heuristic:
-                    self.memory[class_idx][max_index] = entry
-    
-    def get_stats(self, class_idx):
-        entries = self.memory[class_idx]
-        if not entries:
-            return None
-        
-        protos = torch.stack([p for p, _, _ in entries], dim=0)
-        return protos.mean(dim=0)
-    
-    def clear(self):
-        self.memory = {i: [] for i in range(self.num_classes)}
         
 """DIGA"""
 class DIGA(LightningModule):
@@ -1691,11 +1624,9 @@ class DIGA(LightningModule):
         
         self.class_calculation_count = torch.zeros(self.num_classes, device=self.device)
         self.calculation_thresholds = torch.tensor([10, 100, 1000, 2500, 10000], device=self.device)
-
-        self.proto_memory = PrototypeMemory(
-            max_size=self.hparams.cfg.prototype_bank_size,
-            num_classes=self.num_classes
-        )
+        
+        self.timings = []
+        self.max_gpu_mem = 0
         
     # lightning callback
     def on_test_start(self):
@@ -1718,16 +1649,107 @@ class DIGA(LightningModule):
         # loss = self.dot_loss(outputs)
         return loss.cpu(), outputs.cpu(), y.cpu(), info, feature
     
+    def compute_image_miou(self, pred: torch.Tensor, target: torch.Tensor, name: str):
+        pred_mask = pred.argmax(0).cpu().numpy()
+        target_mask = target.cpu().numpy()
+
+        num_classes = self.hparams.dataset_info["num_classes"]
+        ious = []
+        for cls in range(num_classes):
+            pred_inds = (pred_mask == cls)
+            target_inds = (target_mask == cls)
+            intersection = (pred_inds & target_inds).sum()
+            union = (pred_inds | target_inds).sum()
+            if union == 0:
+                continue
+            iou = intersection / union
+            ious.append(iou)
+
+        miou = sum(ious) / len(ious) if len(ious) > 0 else float('nan')
+
+        if not hasattr(self, "image_wise_mious"):
+            self.image_wise_mious = []
+
+        self.image_wise_mious.append({
+            "name": name,
+            "miou": miou
+        })
+        
+    def save_segmentation_image(self, prediction: np.ndarray, name: str, save_dir: str = "/root/duc-loi/output/results/map/masks_0"):
+        trainId2color = {
+            0: (128, 64, 128),   # road
+            1: (244, 35, 232),   # sidewalk
+            2: (70, 70, 70),     # building
+            3: (102, 102, 156),  # wall
+            4: (190, 153, 153),  # fence
+            5: (153, 153, 153),  # pole
+            6: (250, 170, 30),   # traffic light
+            7: (220, 220, 0),    # traffic sign
+            8: (107, 142, 35),   # vegetation
+            9: (152, 251, 152),  # terrain
+            10: (70, 130, 180),  # sky
+            11: (220, 20, 60),   # person
+            12: (255, 0, 0),     # rider
+            13: (0, 0, 142),     # car
+            14: (0, 0, 70),      # truck
+            15: (0, 60, 100),    # bus
+            16: (0, 80, 100),    # train
+            17: (0, 0, 230),     # motorcycle
+            18: (119, 11, 32),   # bicycle
+            255: (0, 0, 0),      # ignored
+        }
+
+        h, w = prediction.shape
+        color_image = np.zeros((h, w, 3), dtype=np.uint8)
+        for label_id, color in trainId2color.items():
+            color_image[prediction == label_id] = color
+
+        save_path = os.path.join(save_dir, f"{name}.png")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        Image.fromarray(color_image).save(save_path)
+        
     def test_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+    
         x, y, shape_, name_ = batch
         loss, preds, targets, info, feature = self.step(batch)
         
+        torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - start_time) * 1000  # convert to ms
+        self.timings.append(elapsed)
+
+        gpu_mem = torch.cuda.max_memory_allocated() / (1024 ** 3)  # in GB
+        self.max_gpu_mem = max(self.max_gpu_mem, gpu_mem)
         # log test metrics
         acc = self.test_acc[dataloader_idx](preds, targets)
         self.log(f"test/loss", loss, on_step=True, on_epoch=True, prog_bar=False, add_dataloader_idx=True)
         self.log(f"test/acc", acc, on_step=True, on_epoch=True, prog_bar=True, add_dataloader_idx=True)
         self.test_step_global += 1
+        
+        # self.compute_image_miou(preds[0], targets[0], name_[0])
+        # pred_mask = preds.argmax(dim=1)[0].numpy().astype(np.uint8) 
+        # img_name = name_[0]
+        # self.save_segmentation_image(prediction=pred_mask, name=img_name)
         return {"loss": loss}
+    
+    def save_image_wise_mious(self, path: str = "/root/duc-loi/output/results/map/image_mious_0.csv"):
+        import csv
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        if not hasattr(self, "image_wise_mious"):
+            return
+
+        with open(path, mode='w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=["name", "miou"])
+            writer.writeheader()
+            for entry in self.image_wise_mious:
+                writer.writerow({
+                    "name": entry["name"],
+                    "miou": round(entry["miou"], 4) if entry["miou"] == entry["miou"] else "NaN"
+                })
 
     def test_epoch_end(self, outputs: List[Any]):
         test_accs = [test_acc.compute() for test_acc in self.test_acc]
@@ -1743,12 +1765,17 @@ class DIGA(LightningModule):
             self.wandb.log_table(key=f"test/class_iou/dataloaderr_idx_{str(i)}", columns=list(class_names), data=[class_iou])
         for i, test_acc in enumerate(self.test_acc): # reset
             test_acc.reset()   
-    
-    def cal_entropy(self, prob):
-        entropy_map = -torch.sum(prob * torch.log(prob + 1e-6), dim=1)
-        B = entropy_map.size(0)
-        mean_entropy = entropy_map.view(B, -1).mean(dim=1)
-        return mean_entropy
+            
+        T_avg = np.mean(self.timings)
+        T_max = np.max(self.timings)
+
+        print(f"\n===== Evaluation Performance =====")
+        print(f"T_avg: {T_avg:.2f} ms")
+        print(f"T_max: {T_max:.2f} ms")
+        print(f"GPU Memory Max: {self.max_gpu_mem:.2f} GB")
+        print("==================================\n")
+            
+        # self.save_image_wise_mious()
     
     def forward_and_adapt(self, pair):
         """Forward and adapt model on batch of data.
@@ -1763,9 +1790,6 @@ class DIGA(LightningModule):
         # no_grad
         feature, outputs = self.net(x, feat=True)
         
-        prob = torch.softmax(outputs, dim=1)
-        entropy = self.cal_entropy(prob)
-        
         to_logs = {}
         outputs_proto, to_logs_ = self.multi_proto_label(
             feature,
@@ -1773,35 +1797,19 @@ class DIGA(LightningModule):
             y, 
             self.hparams.dataset_info.class_names,
             self.hparams.cfg,
-            entropy,
         )
 
         outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs.softmax(1) * (1 - self.hparams.cfg.fusion_lambda)
         
-        # update BN with entropy
-        for m in self.net.modules():
-            if isinstance(m, SIFABatchNorm2d):
-                m.entropy_for_forward = entropy
-        _, _ = self.net(x, feat=True)
-        
         return outputs.cpu(), to_logs, feature
     
-    def high_confident_proto_label(self, outputs, threshold, ratio=0.85):
+    def high_confident_proto_label(self, outputs, threshold):
         prob = outputs.softmax(dim=1)
-        
-        entropy = -torch.sum(prob * torch.log(prob + 1e-6), dim=1)
-        B, H, W = entropy.shape
-        flat_entropy = entropy.flatten()
-        k = int(ratio * flat_entropy.numel())
-        topk_entropy_value = torch.kthvalue(flat_entropy, k).values
-        pseudo_label = prob.argmax(dim=1) 
-        pseudo_label[entropy > topk_entropy_value] = 255
-        
-        # pseudo_label = prob.argmax(dim=1)
-        # pseudo_label[prob.max(dim=1)[0] < threshold] = 255
+        pseudo_label = prob.argmax(dim=1)
+        pseudo_label[prob.max(dim=1)[0] < threshold] = 255
         return pseudo_label
     
-    def multi_proto_label(self, feature, outputs, y, class_names, cfg, entropy):
+    def multi_proto_label(self, feature, outputs, y, class_names, cfg):
         """ Calculate label for each pixel based on multiple prototypes of each class
         Args:
             feature: (B, CH, H, W), feature map
@@ -1830,11 +1838,6 @@ class DIGA(LightningModule):
             ratio=cfg.top_k
         )
         
-        # init or update mean prototypes
-        # if not hasattr(self, "classifier_running_proto"):
-        #     self.classifier_running_proto, self.classifier_running_proto_exists_flag = proto, exists_flag
-        # else:
-        #     self.classifier_running_proto, self.classifier_running_proto_exists_flag = self._update_classifier_proto(proto, exists_flag, self.classifier_running_proto, self.classifier_running_proto_exists_flag, entropy, cfg.proto_rho)
         if not hasattr(self, "classifier_running_proto"):
             num_classes = self.hparams.dataset_info["num_classes"]
             feat_dim = proto.shape[1]
@@ -1846,7 +1849,6 @@ class DIGA(LightningModule):
             exists_flag,
             self.classifier_running_proto,
             self.classifier_running_proto_exists_flag,
-            entropy,
             cfg.proto_rho
         )
         # make prediction
@@ -1882,7 +1884,7 @@ class DIGA(LightningModule):
         return weight
 
     @torch.no_grad()
-    def _update_classifier_proto(self, proto, with_flag, classifier_proto, classifier_proto_exists_flag, entropy, rho=None):
+    def _update_classifier_proto(self, proto, with_flag, classifier_proto, classifier_proto_exists_flag, rho=None):
         classifier_proto, classifier_proto_exists_flag = classifier_proto.clone(), classifier_proto_exists_flag.clone()
   
         for i in range(self.hparams.dataset_info["num_classes"]):
@@ -1893,14 +1895,6 @@ class DIGA(LightningModule):
                 classifier_proto_exists_flag[i] = 1
             else:
                 classifier_proto[i] = (1-rho) * classifier_proto[i] + rho * proto[i]
-            
-            # self.proto_memory.add(proto[i], entropy, i)
-            # proto_mem = self.proto_memory.get_stats(i)
-            
-            # if proto_mem is not None:
-            #     classifier_proto[i] = proto_mem
-            #     classifier_proto_exists_flag[i] = 1
-            
         return classifier_proto, classifier_proto_exists_flag 
 
     def cal_proto(self, feature, y, outputs, ratio=0.5):
