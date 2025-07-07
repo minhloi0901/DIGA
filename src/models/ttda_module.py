@@ -27,6 +27,7 @@ from tqdm import tqdm
 import time 
 import matplotlib.pyplot as plt
 from PIL import Image, ImageEnhance, ImageOps
+import math
 
 logger = logging.getLogger('lightning')
 logging.getLogger('PIL').setLevel(logging.INFO)
@@ -303,117 +304,94 @@ class FeatureMemory(nn.Module):
     def __init__(self, max_size: int):
         super().__init__()
         self.max_size = max_size
-        self.register_buffer('memory', torch.zeros(0))
+        self.memory = []
         
-    def add(self, tensor: torch.Tensor):
-        """Add a tensor to memory with proper cloning and device handling."""
-        # Clone and detach the tensor
-        tensor = tensor.detach().clone()
+    def cal_heuristic(self, entropy, age, alpha_t=0.0, alpha_u=1.0, num_classes=19):
+        sigmoid_age = 1 / (1 + math.exp(-age / len(self.memory)))
+        heuristic = alpha_t * sigmoid_age + alpha_u * (entropy / math.log(num_classes))
+        return heuristic
         
-        # Add to memory
-        if self.memory.numel() == 0:
-            # Initialize memory with the first tensor
-            self.memory = tensor.unsqueeze(0)
+    def add(self, mean, var, entropy, age=0, remove_random=False):
+        for i in range(len(self.memory)):
+            m, v, e, a = self.memory[i]
+            self.memory[i] = (m, v, e, a + 1)
+            
+        entry = (mean, var, entropy, age)
+
+        if len(self.memory) < self.max_size:
+            self.memory.append(entry)
         else:
-            # Ensure both tensors have the same number of dimensions
-            if self.memory.dim() == 1:
-                self.memory = self.memory.unsqueeze(0)
-            if tensor.dim() == 1:
-                tensor = tensor.unsqueeze(0)
-            self.memory = torch.cat([self.memory, tensor], dim=0)
+            if remove_random:
+                rand_index = random.randint(0, len(self.memory) - 1)
+                self.memory[rand_index] = entry
+            else:
+                heuristic_new = self.cal_heuristic(entropy, age)
+                heuristic_list = [self.cal_heuristic(e, a) for (_, _, e, a) in self.memory]
+                max_heuristic = max(heuristic_list)
+                max_index = heuristic_list.index(max_heuristic)
             
-    def remove(self, number: int, status: int = 0):
-        """Remove specified number of entries from memory bank.
-        
-        Args:
-            number: Number of entries to remove
-            status: Removal strategy (0: random, 1: oldest entries)
-        """
-        if self.memory.numel() == 0:
-            return
+                if heuristic_new < max_heuristic:
+                    self.memory[max_index] = entry
             
-        if status == 0:  # Random removal
-            # Generate random indices
-            indices = torch.randperm(len(self))[:number].tolist()
-            # Sort indices in descending order to avoid index shifting
-            for idx in sorted(indices, reverse=True):
-                self.memory = torch.cat([self.memory[:idx], self.memory[idx+1:]])
-        else:  # status == 1, Remove oldest entries
-            # Remove oldest entries
-            self.memory = self.memory[number:]
-            
-    def get_stats(self) -> torch.Tensor:
-        """Get statistics (mean) from memory bank."""
-        if self.memory.numel() == 0:
-            return None
-            
-        return self.memory.mean(dim=0)
+    def get_stats(self):
+        """Return averaged (mean, var) over memory."""
+        if len(self.memory) == 0:
+            return None, None
+
+        means = [m for (m, _, _, _) in self.memory]
+        vars_ = [v for (_, v, _, _) in self.memory]
+
+        mean_avg = sum(means) / len(means)
+        var_avg = sum(vars_) / len(vars_)
+
+        return mean_avg, var_avg
         
     def clear(self):
-        """Clear the memory bank."""
-        self.memory = torch.zeros(0, device=self.memory.device)
-        torch.cuda.empty_cache()
+        self.memory.clear()
         
     def __len__(self):
-        return self.memory.size(0) if self.memory.numel() > 0 else 0
+        return len(self.memory)
 
 class SIFABatchNorm2d(CustomBatchNorm2d):
     def __init__(self, num_features=0, eps=1e-5, momentum=0.1,
                  affine=True, track_running_stats=True):
         super().__init__(num_features, eps, momentum, affine, track_running_stats)
 
-    def update_memory_bank(self, input):
-        """Update memory banks with new batch statistics.
-        
-        Args:
-            input: [B, C, H, W]
-        """
+    def update_memory_bank(self, input, entropy):
         batch_size = input.size(0)
-        # Remove if needed
-        if (len(self.mean_memory) + batch_size > self.memory_bank_size):
-            need_remove = len(self.mean_memory) + batch_size - self.memory_bank_size
-            self.mean_memory.remove(need_remove, status=0)
-            self.var_memory.remove(need_remove, status=0)
-        
-        # Calculate mean and var for each image in the batch
         for i in range(batch_size):
-            # Calculate mean and var for this image
-            img_mean = input[i].mean([1, 2])  # [C]
-            img_var = input[i].var([1, 2], unbiased=False)  # [C]
-            # Add to memory banks
-            self.mean_memory.add(img_mean)
-            self.var_memory.add(img_var)
-
-    def get_memory_bank_stats(self):
-        """Calculate mean and variance from memory bank."""
-        mean_cur = self.mean_memory.get_stats()
-        var_cur = self.var_memory.get_stats()
-            
-        return mean_cur, var_cur
+            img_mean = input[i].mean([1, 2]) 
+            img_var = input[i].var([1, 2], unbiased=False) 
+            entropy_val = entropy[i]
+            self.memory.add(img_mean, img_var, entropy_val)
 
     def forward(self, input):
         self._check_input_dim(input)
         
-        mean_cur = input.mean([0, 2, 3])
-        var_cur = input.var([0, 2, 3], unbiased=False)
-        
-        if not hasattr(self, 'mean_memory'):
-            self.mean_memory = FeatureMemory(self.memory_bank_size) 
-            self.var_memory = FeatureMemory(self.memory_bank_size) 
+        if not hasattr(self, 'memory'):
+            self.memory = FeatureMemory(self.memory_bank_size)
             
-        # Update memory banks
-        self.update_memory_bank(input)
-        mean_cur, var_cur = self.get_memory_bank_stats()
+        mean_now = input.mean([0, 2, 3])
+        var_now = input.var([0, 2, 3], unbiased=False)
+        k = len(self.memory)
+        mean_mem, var_mem = self.memory.get_stats()
+        
+        if mean_mem is None or k == 0:
+            mean_cur = mean_now
+            var_cur = var_now
+        else:
+            B = input.size(0)
+            mean_cur = (k * mean_mem + B * mean_now) / (k + B)
+            var_cur = (k * var_mem + B * var_now) / (k + B)
 
+        entropy = getattr(self, 'entropy_for_forward', None)
+        if entropy is not None:
+            self.update_memory_bank(input, entropy)
+            del self.entropy_for_forward
+            
         mean = self.lambda_ * self.running_mean + (1-self.lambda_) * mean_cur
         var = self.lambda_ * self.running_var + (1-self.lambda_) * var_cur
-  
-        self.mean = mean.detach() 
-        self.var = var.detach()
-        # normal train -> update running mean, var. use current mean, var
-        # target 
-        # eval -> use self.running_mean, self.running_var
-        # source + current 
+
         input = (input - mean[None, :, None, None]) / (torch.sqrt(var[None, :, None, None] + self.eps))
         if self.affine:
             input = input * self.weight[None, :, None, None] + self.bias[None, :, None, None]
@@ -1632,7 +1610,51 @@ class SegmentationMultiLevelModule(SegmentationBasicModule):
             }
         }
 
+class PrototypeMemory(nn.Module):
+    def __init__(self, max_size: int, num_classes: int):
+        super().__init__()
+        self.max_size = max_size
+        self.num_classes = num_classes
+        self.memory = {i: [] for i in range(num_classes)}
+    
+    def cal_heuristic(self, entropy, age, alpha_t=1.0, alpha_u=1.0, num_classes=19):
+        sigmoid_age = 1 / (1 + math.exp(-age / (self.max_size + 1)))
+        heuristic = alpha_t * sigmoid_age + alpha_u * (entropy / math.log(num_classes))
+        return heuristic
+    
+    def add(self, proto, entropy, class_idx, remove_random=False):
+        entry = (proto.detach().clone(), entropy, 0)
+        
+        for i in range(len(self.memory[class_idx])):
+            p, e, a = self.memory[class_idx][i]
+            self.memory[class_idx][i] = (p, e, a + 1)
+        
+        if len(self.memory[class_idx]) < self.max_size:
+            self.memory[class_idx].append(entry)
+        else:
+            if remove_random:
+                rand_index = random.randint(0, len(self.memory[class_idx]) - 1)
+                self.memory[class_idx][rand_index] = entry
+            else:
+                heuristic_new = self.cal_heuristic(entropy, 0)
+                heuristic_list = [self.cal_heuristic(e, a) for (_, e, a) in self.memory[class_idx]]
+                max_heuristic = max(heuristic_list)
+                max_index = heuristic_list.index(max_heuristic)
 
+                if heuristic_new < max_heuristic:
+                    self.memory[class_idx][max_index] = entry
+    
+    def get_stats(self, class_idx):
+        entries = self.memory[class_idx]
+        if not entries:
+            return None
+        
+        protos = torch.stack([p for p, _, _ in entries], dim=0)
+        return protos.mean(dim=0)
+    
+    def clear(self):
+        self.memory = {i: [] for i in range(self.num_classes)}
+        
 """DIGA"""
 class DIGA(LightningModule):
     def __init__(
@@ -1661,23 +1683,20 @@ class DIGA(LightningModule):
         
         self.test_step_global = 0
         
-        # Track forward step mean and variance from SIFA BN layers
-        self.forward_means = []
-        self.forward_vars = []
-        self.batch_indices = []
-        # DOT settings
         self.num_classes = self.hparams.dataset_info['num_classes']
-        self.z_t = torch.ones(self.num_classes) / self.num_classes
         
         self.save_hyperparameters(logger=False, ignore=["net"])
         self._replace_bn()
         self._configure_bn_running_stats()
         
-        # Augmentation config
-        self.severity = 2.0
-        self.mean = torch.tensor([128.0, 128.0, 128.0]).view(3, 1, 1)
-        self.std = torch.tensor([1.0, 1.0, 1.0]).view(3, 1, 1)
-    
+        self.class_calculation_count = torch.zeros(self.num_classes, device=self.device)
+        self.calculation_thresholds = torch.tensor([10, 100, 1000, 2500, 10000], device=self.device)
+
+        self.proto_memory = PrototypeMemory(
+            max_size=self.hparams.cfg.prototype_bank_size,
+            num_classes=self.num_classes
+        )
+        
     # lightning callback
     def on_test_start(self):
         # metric to cpu
@@ -1689,7 +1708,7 @@ class DIGA(LightningModule):
         if isinstance(outputs, tuple):
             outputs = outputs[-1]
         return outputs
-
+    
     def step(self, batch: Any):
         x, y, shape_, name_ = batch
         target_size = y.shape[-2:]
@@ -1709,36 +1728,6 @@ class DIGA(LightningModule):
         self.log(f"test/acc", acc, on_step=True, on_epoch=True, prog_bar=True, add_dataloader_idx=True)
         self.test_step_global += 1
         return {"loss": loss}
-    
-    def forward_and_adapt(self, pair):
-        """Forward and adapt model on batch of data.
-        Measure entropy of the model prediction, take gradients, and update params.
-        Return: 
-        1. model outputs; 
-        2. the number of reliable and non-redundant samples; 
-        3. the number of reliable samples;
-        4. the moving average  probability vector over all previous samples
-        """
-        x, y = pair
-        # no_grad
-        x2 = x.detach()
-        x2 = self.randaugment_color_jitter(x2)
-        feature, outputs = self.net(x, feat=True)
-        # aug
-        feature2, outputs2 = self.net(x2, feat=True)
-        
-        to_logs = {}
-        outputs_proto, to_logs_ = self.multi_proto_label(
-            feature2,
-            outputs,
-            outputs2, 
-            y, 
-            self.hparams.dataset_info.class_names,
-            self.hparams.cfg,
-        )
-
-        outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs.softmax(1) * (1 - self.hparams.cfg.fusion_lambda)
-        return outputs.cpu(), to_logs, feature
 
     def test_epoch_end(self, outputs: List[Any]):
         test_accs = [test_acc.compute() for test_acc in self.test_acc]
@@ -1755,20 +1744,64 @@ class DIGA(LightningModule):
         for i, test_acc in enumerate(self.test_acc): # reset
             test_acc.reset()   
     
-    def high_confident_proto_label(self, outputs1, outputs2, threshold):
-        outputs2 = outputs2.softmax(dim=1)
+    def cal_entropy(self, prob):
+        entropy_map = -torch.sum(prob * torch.log(prob + 1e-6), dim=1)
+        B = entropy_map.size(0)
+        mean_entropy = entropy_map.view(B, -1).mean(dim=1)
+        return mean_entropy
+    
+    def forward_and_adapt(self, pair):
+        """Forward and adapt model on batch of data.
+        Measure entropy of the model prediction, take gradients, and update params.
+        Return: 
+        1. model outputs; 
+        2. the number of reliable and non-redundant samples; 
+        3. the number of reliable samples;
+        4. the moving average  probability vector over all previous samples
+        """
+        x, y = pair
+        # no_grad
+        feature, outputs = self.net(x, feat=True)
         
-        pseudo_label1 = outputs1.argmax(dim=1)
-        pseudo_label2 = outputs2.argmax(dim=1)
+        prob = torch.softmax(outputs, dim=1)
+        entropy = self.cal_entropy(prob)
         
-        pseudo_label = pseudo_label2.clone()
+        to_logs = {}
+        outputs_proto, to_logs_ = self.multi_proto_label(
+            feature,
+            outputs,
+            y, 
+            self.hparams.dataset_info.class_names,
+            self.hparams.cfg,
+            entropy,
+        )
+
+        outputs = outputs_proto * self.hparams.cfg.fusion_lambda + outputs.softmax(1) * (1 - self.hparams.cfg.fusion_lambda)
         
-        pseudo_label[pseudo_label1 != pseudo_label2] = 255
-        pseudo_label[outputs2.max(dim=1)[0] < threshold] = 255
+        # update BN with entropy
+        for m in self.net.modules():
+            if isinstance(m, SIFABatchNorm2d):
+                m.entropy_for_forward = entropy
+        _, _ = self.net(x, feat=True)
         
+        return outputs.cpu(), to_logs, feature
+    
+    def high_confident_proto_label(self, outputs, threshold, ratio=0.85):
+        prob = outputs.softmax(dim=1)
+        
+        entropy = -torch.sum(prob * torch.log(prob + 1e-6), dim=1)
+        B, H, W = entropy.shape
+        flat_entropy = entropy.flatten()
+        k = int(ratio * flat_entropy.numel())
+        topk_entropy_value = torch.kthvalue(flat_entropy, k).values
+        pseudo_label = prob.argmax(dim=1) 
+        pseudo_label[entropy > topk_entropy_value] = 255
+        
+        # pseudo_label = prob.argmax(dim=1)
+        # pseudo_label[prob.max(dim=1)[0] < threshold] = 255
         return pseudo_label
     
-    def multi_proto_label(self, feature, outputs1, outputs2, y, class_names, cfg):
+    def multi_proto_label(self, feature, outputs, y, class_names, cfg, entropy):
         """ Calculate label for each pixel based on multiple prototypes of each class
         Args:
             feature: (B, CH, H, W), feature map
@@ -1787,29 +1820,42 @@ class DIGA(LightningModule):
         multi_pred, to_logs = None, {}
         
         proto_label = self.high_confident_proto_label(
-            outputs1,
-            outputs2, 
+            outputs,
             threshold=cfg.confidence_threshold
         )
         proto, exists_flag = self.cal_proto(
             feature,
             proto_label, 
-            outputs1, 
+            outputs, 
             ratio=cfg.top_k
         )
         
         # init or update mean prototypes
+        # if not hasattr(self, "classifier_running_proto"):
+        #     self.classifier_running_proto, self.classifier_running_proto_exists_flag = proto, exists_flag
+        # else:
+        #     self.classifier_running_proto, self.classifier_running_proto_exists_flag = self._update_classifier_proto(proto, exists_flag, self.classifier_running_proto, self.classifier_running_proto_exists_flag, entropy, cfg.proto_rho)
         if not hasattr(self, "classifier_running_proto"):
-            self.classifier_running_proto, self.classifier_running_proto_exists_flag = proto, exists_flag
-        else:
-            self.classifier_running_proto, self.classifier_running_proto_exists_flag = self._update_classifier_proto(proto, exists_flag, self.classifier_running_proto, self.classifier_running_proto_exists_flag, cfg.proto_rho)
+            num_classes = self.hparams.dataset_info["num_classes"]
+            feat_dim = proto.shape[1]
+            self.classifier_running_proto = torch.zeros(num_classes, feat_dim, device=proto.device)
+            self.classifier_running_proto_exists_flag = torch.zeros(num_classes, device=proto.device)
+        
+        self.classifier_running_proto, self.classifier_running_proto_exists_flag = self._update_classifier_proto(
+            proto,
+            exists_flag,
+            self.classifier_running_proto,
+            self.classifier_running_proto_exists_flag,
+            entropy,
+            cfg.proto_rho
+        )
         # make prediction
         instance_pred = self.cal_pred_of_proto(feature, proto, exists_flag)
         mean_pred = self.cal_pred_of_proto(feature, self.classifier_running_proto, self.classifier_running_proto_exists_flag)
         multi_pred = cfg.proto_lambda * mean_pred + (1-cfg.proto_lambda) * instance_pred
         return multi_pred, to_logs
     
-    def cal_pred_of_proto(self, feature, proto, exists_flag, tau=2.0):
+    def cal_pred_of_proto(self, feature, proto, exists_flag, tau=2.0, dist_threshold=1.0):
         """ Calculate the weight for classes of each pixel.
         For each pixel, we calculate the distance between the prototype of each class and the feature of the pixel.
         Then, we calculate the weight of each class by softmax with temperature tau.
@@ -1826,67 +1872,36 @@ class DIGA(LightningModule):
         # calculate distance
         feature = feature.unsqueeze(1) # [B, 1, CH, H, W]
         proto = proto.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) # [1, C, CH, 1, 1]
-        # feature_norm = feature / (feature.norm(dim=2, keepdim=True) + 1e-8)
-        # proto_norm = proto / (proto.norm(dim=2, keepdim=True) + 1e-8)
-        # cos_sim = torch.sum(feature_norm * proto_norm, dim=2)
-        # dist = 1 - cos_sim
+     
         dist = torch.norm(proto - feature, dim=2) # [B, C, H, W]
-        # calculate weight by softmax
+     
         weight = torch.exp(-dist / tau) # [B, C, H, W]
         weight = weight * exists_flag.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) # [B, C, H, W]
-        weight = weight / torch.sum(weight, dim=1, keepdim=True) # [B, C, H, W]
+        denom = torch.sum(weight, dim=1, keepdim=True) + 1e-6
+        weight = weight / denom # [B, C, H, W]
         return weight
 
     @torch.no_grad()
-    def _update_classifier_proto(self, proto, with_flag, classifier_proto, classifier_proto_exists_flag, rho=None):
-        """Update the prototype of the classifier.
-        Args:
-            feature: [B, CH, H, W]
-            y: [B, H, W]
-        Returns:
-            proto: [C, CH]
-        """
-        # clone classifier proto and exists flag
+    def _update_classifier_proto(self, proto, with_flag, classifier_proto, classifier_proto_exists_flag, entropy, rho=None):
         classifier_proto, classifier_proto_exists_flag = classifier_proto.clone(), classifier_proto_exists_flag.clone()
-        # calculate mean of each class
-        """ Update prototype for each class
-        At first, we need to calculate the mean of each class and numbers of pixels of each class.
-        Then, we can update the prototype of each class by total ratio.
-        Args:
-            feature: [B, C, H, W]
-            y: [B, H, W]
-        """
-        # update (set for the first time, update for the rest) 
+  
         for i in range(self.hparams.dataset_info["num_classes"]):
-            if not with_flag[i] or rho == 0: continue
+            if not with_flag[i]: continue
+            
             if classifier_proto_exists_flag[i] == 0:
                 classifier_proto[i] = proto[i]
                 classifier_proto_exists_flag[i] = 1
             else:
                 classifier_proto[i] = (1-rho) * classifier_proto[i] + rho * proto[i]
+            
+            # self.proto_memory.add(proto[i], entropy, i)
+            # proto_mem = self.proto_memory.get_stats(i)
+            
+            # if proto_mem is not None:
+            #     classifier_proto[i] = proto_mem
+            #     classifier_proto_exists_flag[i] = 1
+            
         return classifier_proto, classifier_proto_exists_flag 
-
-    @torch.no_grad()
-    def proto_weight(self, proto, feature, tau=1.0):
-        """ Calculate the weight for classes of each pixel.
-        For each pixel, we calculate the distance between the prototype of each class and the feature of the pixel.
-        Then, we calculate the weight of each class by softmax with temperature tau.
-        Args:
-            protos: [C, CH]
-            feature: [B, CH, H, W]
-            tau: temperature
-        Returns:
-            weight: [B, C, H, W]
-        """
-        # calculate distance
-        # [B, C, CH, H, W]
-        proto = proto.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-        feature = feature.unsqueeze(1)
-        # dist = torch.norm(proto - feature, dim=2)
-        dist = self.fidelity(feature, proto)
-        # calculate weight
-        weight = torch.softmax(-dist / tau, dim=1)
-        return weight
 
     def cal_proto(self, feature, y, outputs, ratio=0.5):
         """ Calculate the prototype of each class with the given feature and label.
@@ -1929,7 +1944,7 @@ class DIGA(LightningModule):
             # if isinstance(m, nn.BatchNorm2d):
             if isinstance(m, SIFABatchNorm2d):
                 m.lambda_.data = torch.tensor(self.hparams.cfg.bn_lambda)
-                m.memory_bank_size = self.hparams.cfg.memory_bank_size
+                m.memory_bank_size = self.hparams.cfg.bn_bank_size
     
     def _replace_bn(self):
         """
@@ -1950,59 +1965,7 @@ class DIGA(LightningModule):
         # use replace all batch norm module m in self.net with custom batch norm module
         for n, module in self.net.named_modules():
             if isinstance(module, nn.BatchNorm2d):
-                set_layer(self.net, n, SIFABatchNorm2dTrainable().from_bn(module).to(self.device))
-    
-    def unnormalize(self, x):
-        return (x * self.std.to(x.device)) + self.mean.to(x.device)
-    
-    def normalize(self, x):
-        return (x - self.mean.to(x.device)) / self.std.to(x.device)
-    
-    def autocontrast(self, img, severity):
-        return ImageOps.autocontrast(img)
-
-    def equalize(self, img, severity):
-        return ImageOps.equalize(img)
-
-    def brightness(self, img, severity):
-        enhancer = ImageEnhance.Brightness(img)
-        factor = 1 + (severity / 30) * 1.8
-        return enhancer.enhance(factor)
-    
-    def sharpness(self, img, severity):
-        enhancer = ImageEnhance.Sharpness(img)
-        factor = 1 + (severity / 30) * 1.8
-        return enhancer.enhance(factor)
-    
-    def randaugment_color_jitter(self, x):
-        is_batched = (x.dim() == 4)
-        if is_batched:
-            x = x.squeeze(0) # [1, C, H, W] -> [C, H, W]
-        
-        x_unnorm = self.unnormalize(x)
-        x_unnorm = x_unnorm.clamp(0, 255)
-        x_uint8 = x_unnorm.byte()
-        
-        img = F1.to_pil_image(x_uint8.cpu())
-        transforms = [
-            (self.autocontrast, "AutoContrast"),
-            (self.equalize, "Equalize"),
-            (self.brightness, "Brightness"),
-            (self.sharpness, "Sharpness")
-        ]
-
-        transform, name = random.choice(transforms)
-        # transform, name = transforms[3]
-        # print(f"Applying transform: {name}")
-        
-        img = transform(img, self.severity)
-        img_tensor = F1.to_tensor(img).to(x.device) * 255
-        
-        img_tensor = self.normalize(img_tensor)
-        
-        if is_batched:
-            img_tensor = img_tensor.unsqueeze(0)
-        return img_tensor
+                set_layer(self.net, n, SIFABatchNorm2d().from_bn(module).to(self.device))
     
     # others
     @property

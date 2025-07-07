@@ -183,17 +183,19 @@ def make_dataset(root, mode_input, maxSkip=0, cv_split=0):
     assert mode in ['train', 'val', 'test', 'trainval', 'small']
     img_path = os.path.join(root, 'images/10k') # TODO
     mask_path = os.path.join(root, 'labels/sem_seg/masks')
-    mask_postfix = '_train_id.png'
+    # mask_postfix = '_train_id.png'
+    mask_postfix = '.png'
     # cv_splits = make_cv_splits(img_dir_name)
     if mode == 'trainval':
         modes = ['train', 'val']
     else:
         modes = [mode]
+        
     for mode in modes:
         logging.info('{} fine cities: '.format(mode))
         add_items(items, aug_items, img_path, mask_path,
                     mask_postfix, mode, maxSkip)
-
+    
     logging.info('BDD100K-{}: {} images'.format(mode, len(items) + len(aug_items)))
     if sample is not None:
         import random
