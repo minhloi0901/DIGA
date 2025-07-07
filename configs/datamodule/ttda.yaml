@@ -10,11 +10,11 @@ batch_size: 1
 num_workers: ${oc.decode:${oc.env:NUM_WORKERS}}
 pin_memory: False
 train_list: # ! not used
-  - _target_: src.datamodules.ttda_datamodule.CityscapesDataSet
+  - _target_: src.datamodules.ttda_datamodule.BDD100KDataSet
     _partial_: True
     set: train 
 val_list: # ! not used
-  - _target_: src.datamodules.ttda_datamodule.CityscapesDataSet 
+  - _target_: src.datamodules.ttda_datamodule.BDD100KDataSet 
     _partial_: True
     set: val
 # test_list:
